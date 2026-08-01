@@ -925,6 +925,7 @@ class DeepseekV3ForCausalLM(PyModelBase):
         state_dicts: list,
         tp_rank: int,
         tp_size: int,
+        load_lm_head: bool = True,
     ) -> None:
         cfg = self.cfg
         tp_size = cfg.tp_size
@@ -1054,4 +1055,5 @@ class DeepseekV3ForCausalLM(PyModelBase):
                 self.model.layers[i].mlp.process_weights_after_loading()
 
         copy_in("model.norm.weight", load_tensor("model.norm.weight"))
-        copy_in("lm_head.weight", shard(load_tensor("lm_head.weight"), dim=0))
+        if load_lm_head:
+            copy_in("lm_head.weight", shard(load_tensor("lm_head.weight"), dim=0))

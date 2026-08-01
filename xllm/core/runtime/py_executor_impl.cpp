@@ -188,10 +188,13 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
   }
 
   py::object py_metadata = py::cast(AttentionMetadataView(attn_metadata));
+  py::object input_embedding = params.embedding.input_embedding.defined()
+                                   ? py::cast(params.embedding.input_embedding)
+                                   : py::none();
 
   // Execute: one C++ -> Python call per step.
-  py::object hidden_obj =
-      py_executor_.attr("execute")(tokens, positions, py_metadata);
+  py::object hidden_obj = py_executor_.attr("execute")(
+      tokens, positions, py_metadata, input_embedding);
   return ModelOutput(hidden_obj.cast<torch::Tensor>());
 }
 

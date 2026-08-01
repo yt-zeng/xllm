@@ -97,6 +97,10 @@ class LLMWorkerImpl : public WorkerImpl {
     model_->set_word_embedding(embedding);
   };
 
+  bool share_weights_from(LLMWorkerImpl& source) {
+    return model_->share_weights_from(*source.model_);
+  }
+
   // DFlash-specific delegate: eagerly project target hidden into the draft's
   // per-layer KV cache. Runs outside the executor because the pass has no
   // attention and its shape doesn't match the decode graph. See CausalLM.

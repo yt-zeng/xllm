@@ -36,5 +36,6 @@ class BaseRunner(ABC):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         metadata: AttentionMetadata,
+        input_embedding: torch.Tensor | None = None,
     ) -> torch.Tensor:
         pass

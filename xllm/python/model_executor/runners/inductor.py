@@ -34,7 +34,10 @@ class InductorRunner(BaseRunner):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         metadata: AttentionMetadata,
+        input_embedding: torch.Tensor | None = None,
     ) -> torch.Tensor:
         self.attention_backend.prepare(metadata)
         with forward_context(ForwardContext(self.attention_backend, self.device)):
-            return self.compiled_model(input_ids, positions)
+            if input_embedding is None:
+                return self.compiled_model(input_ids, positions)
+            return self.compiled_model(input_ids, positions, input_embedding)

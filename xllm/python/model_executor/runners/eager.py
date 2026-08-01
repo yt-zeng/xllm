@@ -30,7 +30,10 @@ class EagerRunner(BaseRunner):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         metadata: AttentionMetadata,
+        input_embedding: torch.Tensor | None = None,
     ) -> torch.Tensor:
         self.attention_backend.prepare(metadata)
         with forward_context(ForwardContext(self.attention_backend, self.device)):
-            return self.model(input_ids, positions)
+            if input_embedding is None:
+                return self.model(input_ids, positions)
+            return self.model(input_ids, positions, input_embedding)
