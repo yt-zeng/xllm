@@ -117,6 +117,7 @@ def _(input, smooth_scales, group_index, dst_type):
 
 
 lightning_indexer = torch.ops.xllm_ops.lightning_indexer
+lightning_indexer_out = torch.ops.xllm_ops.lightning_indexer_out
 
 
 @torch.library.register_fake("xllm_ops::lightning_indexer")
@@ -144,6 +145,27 @@ def _(
     return query.new_zeros(out_shape, dtype=torch.int32)
 
 
+@torch.library.register_fake("xllm_ops::lightning_indexer_out")
+def _(
+    query,
+    key,
+    weights,
+    query_seq_lengths,
+    key_seq_lengths,
+    block_table,
+    layout_query,
+    layout_key,
+    selected_count,
+    sparse_mode,
+    pre_tokens,
+    next_tokens,
+    return_value,
+    sparse_indices_out,
+    sparse_values_out,
+):
+    return sparse_indices_out
+
+
 scatter_nd_update = torch.ops.xllm_ops.scatter_nd_update
 
 
@@ -153,6 +175,7 @@ def _(var, indices, updates):
 
 
 sparse_flash_attention = torch.ops.xllm_ops.sparse_flash_attention
+sparse_flash_attention_out = torch.ops.xllm_ops.sparse_flash_attention_out
 
 
 @torch.library.register_fake("xllm_ops::sparse_flash_attention")
@@ -173,3 +196,24 @@ def _(
     sparse_mode,
 ):
     return query.new_empty(query.shape, dtype=query.dtype)
+
+
+@torch.library.register_fake("xllm_ops::sparse_flash_attention_out")
+def _(
+    query,
+    key,
+    value,
+    sparse_indices,
+    block_table,
+    actual_seq_lengths_query,
+    actual_seq_lengths_kv,
+    query_rope,
+    key_rope,
+    scale_value,
+    sparse_block_size,
+    layout_query,
+    layout_kv,
+    sparse_mode,
+    output,
+):
+    return output
