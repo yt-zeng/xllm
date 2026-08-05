@@ -39,6 +39,23 @@ def _(input):
     return input.new_empty(shape)
 
 
+static_quant_matmul_rms_norm = torch.ops.xllm_ops.static_quant_matmul_rms_norm
+
+
+@torch.library.register_fake("xllm_ops::static_quant_matmul_rms_norm")
+def _(
+    input,
+    weight,
+    deq_scale,
+    quant_bias,
+    input_scale_recip,
+    input_offset,
+    norm_weight,
+    eps,
+):
+    return input.new_empty((*input.shape[:-1], weight.shape[-1]), dtype=norm_weight.dtype)
+
+
 # ---------------------------------------------------------------------------
 # Fused per-head QK-RMSNorm + RoPE
 # ---------------------------------------------------------------------------

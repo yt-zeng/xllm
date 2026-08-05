@@ -1,0 +1,10 @@
+{"prompt":"Janet has 12 apples and gives 5 apples to Tom. How many apples does Janet have left? Answer with a number and a short explanation.","max_tokens":64}
+{"prompt":"A train travels 180 kilometers in 3 hours. What is its average speed in kilometers per hour? Answer with a number and a short explanation.","max_tokens":64}
+{"prompt":"There are 7 boxes with 8 books in each box. How many books are there altogether? Answer with a number and a short explanation.","max_tokens":64}
+{"prompt":"A shop reduces the price of a 80 dollar item by 25 percent. What is the sale price? Answer with a number and a short explanation.","max_tokens":64}
+{"prompt":"Sarah reads 15 pages on Monday and twice as many pages on Tuesday. How many pages does she read in total? Answer with a number and a short explanation.","max_tokens":64}
+{"prompt":"A farmer has 48 eggs and packs them equally into cartons of 12. How many cartons are needed? Answer with a number and a short explanation.","max_tokens":64}
+{"prompt":"A rectangle is 9 meters long and 4 meters wide. What is its area in square meters? Answer with a number and a short explanation.","max_tokens":64}
+{"prompt":"A class has 24 students. One third of them are absent. How many students are present? Answer with a number and a short explanation.","max_tokens":64}
+{"prompt":"A water tank contains 150 liters. After using 38 liters, how many liters remain? Answer with a number and a short explanation.","max_tokens":64}
+{"prompt":"A movie starts at 14:20 and lasts 1 hour 45 minutes. At what time does it end? Answer with the time and a short explanation.","max_tokens":64}

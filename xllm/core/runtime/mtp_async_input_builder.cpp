@@ -56,10 +56,69 @@ void apply_device_row_metadata(ForwardInput& input,
 }
 
 #if defined(USE_NPU)
+void expand_decode_attention_metadata(ForwardInput& draft_input,
+                                      const ForwardInput& block_table_source,
+                                      const torch::Tensor& kv_seq_lens,
+                                      int32_t block_size) {
+  const torch::Tensor& source_block_tables =
+      block_table_source.input_params.attention.device.block_tables;
+  if (!source_block_tables.defined() || source_block_tables.dim() != 2) {
+    return;
+  }
+
+  CHECK_EQ(kv_seq_lens.dim(), 1);
+  CHECK_EQ(source_block_tables.size(0), kv_seq_lens.size(0));
+  CHECK_GT(block_size, 0);
+
+  torch::Tensor expanded_kv_seq_lens =
+      torch::stack({kv_seq_lens - 1, kv_seq_lens}, /*dim=*/1).flatten();
+  torch::Tensor expanded_block_tables =
+      source_block_tables.repeat_interleave(/*repeats=*/2, /*dim=*/0);
+  torch::Tensor page_counts =
+      torch::div(expanded_kv_seq_lens + block_size - 1, block_size, "trunc");
+  page_counts = page_counts.clamp_min(1);
+  torch::Tensor page_offsets =
+      torch::arange(source_block_tables.size(1), source_block_tables.options());
+  torch::Tensor valid_pages =
+      page_offsets.unsqueeze(0) < page_counts.unsqueeze(1);
+
+  draft_input.input_params.attention.device.block_tables =
+      expanded_block_tables.contiguous();
+  draft_input.input_params.attention.device.paged_kv_indices =
+      expanded_block_tables.masked_select(valid_pages).contiguous();
+  draft_input.input_params.attention.device.paged_kv_indptr =
+      torch::cat({torch::zeros({1}, page_counts.options()),
+                  torch::cumsum(page_counts, /*dim=*/0)});
+  draft_input.input_params.attention.device.paged_kv_last_page_len =
+      torch::remainder(expanded_kv_seq_lens - 1, block_size) + 1;
+
+  // Keep the graph metadata on the same expanded [repair, current] layout as
+  // the tensors consumed by the Python executor.  In particular, do not use
+  // the copied host KV vector here: the fused kernel has already resolved
+  // rejection-dependent lengths on device.
+  draft_input.input_params.graph.use_expanded_decode_for_spec_verify_attention =
+      true;
+  draft_input.input_params.graph.expanded_kv_seq_lens = expanded_kv_seq_lens;
+  draft_input.input_params.graph.expanded_block_tables = expanded_block_tables;
+  draft_input.input_params.graph.expanded_tiling_data = torch::Tensor();
+  draft_input.input_params.graph.expanded_kv_seq_lens_vec.clear();
+
+  const torch::Tensor& source_host_block_tables =
+      block_table_source.input_params.attention.host.block_tables;
+  if (source_host_block_tables.defined() &&
+      source_host_block_tables.device().is_cpu()) {
+    draft_input.input_params.attention.host.block_tables =
+        source_host_block_tables.repeat_interleave(/*repeats=*/2,
+                                                   /*dim=*/0);
+  }
+}
+
 void apply_mtp_prepare_output(
     ForwardInput& draft_input,
+    const ForwardInput& block_table_source,
     const kernel::npu::MtpPrepareNextDraftOutput& output,
-    bool use_chunked_prefill) {
+    bool use_chunked_prefill,
+    int32_t block_size) {
   draft_input.token_ids = output.token_ids;
   draft_input.input_params.embedding.input_embedding = output.embeddings;
   draft_input.positions = output.positions;
@@ -72,6 +131,10 @@ void apply_mtp_prepare_output(
   }
   draft_input.input_params.attention.device.new_cache_slots =
       output.cache_slots;
+  if (!use_chunked_prefill) {
+    expand_decode_attention_metadata(
+        draft_input, block_table_source, output.kv_seq_lens, block_size);
+  }
 }
 #endif
 
@@ -98,7 +161,11 @@ void prepare_next_draft_from_accepted_state(
         block_table_source.input_params.attention.device.block_tables,
         block_size);
     if (output.has_value()) {
-      apply_mtp_prepare_output(draft_input, *output, use_chunked_prefill);
+      apply_mtp_prepare_output(draft_input,
+                               block_table_source,
+                               *output,
+                               use_chunked_prefill,
+                               block_size);
       return;
     }
   }

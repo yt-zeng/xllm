@@ -93,6 +93,24 @@ def _yarn_linear_ramp_mask(
     return torch.clamp(linear, 0, 1)
 
 
+def _apply_interleaved_rope(
+    x: torch.Tensor,
+    positions: torch.Tensor,
+    rotary: RotaryEmbedding,
+) -> torch.Tensor:
+    """Apply interleaved RoPE with one NPU kernel for an indexer tensor."""
+    cos_sin = rotary.cos_sin_cache[positions]
+    half = cos_sin.size(-1) // 2
+    cos = torch.cat([cos_sin[..., :half], cos_sin[..., :half]], dim=-1)
+    sin = torch.cat([cos_sin[..., half:], cos_sin[..., half:]], dim=-1)
+    token_count, head_count, rope_dim = x.shape
+    return torch_npu.npu_interleave_rope(
+        x.view(token_count, head_count, 1, rope_dim),
+        cos.unsqueeze(1).unsqueeze(1),
+        sin.unsqueeze(1).unsqueeze(1),
+    ).view(token_count, head_count, rope_dim)
+
+
 class DeepseekYarnRotaryEmbedding(RotaryEmbedding):
     """YaRN-scaled RoPE for DeepSeek-V3.2."""
 
@@ -198,6 +216,9 @@ class DeepseekV3Config:
     index_n_heads: int = 64
     index_head_dim: int = 128
     index_topk: int = 2048
+    index_topk_freq: int = 1
+    index_topk_pattern: str = ""
+    index_skip_topk_offset: int = 0
     first_k_dense_replace: int = 3
     moe_layer_freq: int = 1
     n_routed_experts: int = 256
@@ -211,6 +232,7 @@ class DeepseekV3Config:
     moe_intermediate_size: int = 2048
     tp_size: int = 1
     tp_rank: int = 0
+    model_type: str = "deepseek_v32"
 
     @classmethod
     def from_dict(cls, d: dict) -> "DeepseekV3Config":
@@ -237,6 +259,7 @@ class DeepseekV3Config:
         hidden = int(pick("hidden_size", default=2048))
         n_heads = int(pick("n_heads", "num_attention_heads", default=128))
         return cls(
+            model_type=str(pick("model_type", default="deepseek_v32")),
             hidden_size=hidden,
             n_layers=int(pick("n_layers", "num_hidden_layers", default=61)),
             n_heads=n_heads,
@@ -262,6 +285,11 @@ class DeepseekV3Config:
             index_n_heads=int(pick("index_n_heads", default=64)),
             index_head_dim=int(pick("index_head_dim", default=128)),
             index_topk=int(pick("index_topk", default=2048)),
+            index_topk_freq=int(pick("index_topk_freq", default=1)),
+            index_topk_pattern=str(pick("index_topk_pattern", default="")),
+            index_skip_topk_offset=int(
+                pick("index_skip_topk_offset", default=0)
+            ),
             qk_nope_head_dim=int(pick("qk_nope_head_dim", default=128)),
             qk_rope_head_dim=int(pick("qk_rope_head_dim", default=64)),
             v_head_dim=int(pick("v_head_dim", default=128)),
@@ -286,6 +314,55 @@ class DeepseekV3Config:
         """Per-rank (num_heads_local, num_kv_heads_local=1)."""
         num_heads_local = self.n_heads // self.tp_size
         return num_heads_local, 1
+
+
+def _dsa_topk_share_decisions(
+    cfg: DeepseekV3Config,
+) -> list[tuple[bool, bool]]:
+    """Resolve the Python equivalent of C++ ``DsaTopkSharePlan``."""
+    decisions = [(False, False) for _ in range(cfg.n_layers)]
+    if (
+        cfg.model_type.endswith("_mtp")
+        or cfg.index_n_heads <= 0
+        or cfg.index_head_dim <= 0
+        or cfg.index_topk <= 0
+    ):
+        return decisions
+
+    reuse: list[bool]
+    if cfg.index_topk_pattern:
+        if len(cfg.index_topk_pattern) != cfg.n_layers:
+            raise ValueError(
+                "index_topk_pattern length must equal n_layers"
+            )
+        reuse = []
+        for symbol in cfg.index_topk_pattern.upper():
+            if symbol not in ("F", "S"):
+                raise ValueError(
+                    "index_topk_pattern only supports F and S"
+                )
+            reuse.append(symbol == "S")
+    elif cfg.index_topk_freq > 1:
+        if cfg.index_skip_topk_offset < 0:
+            raise ValueError("index_skip_topk_offset must be non-negative")
+        reuse = []
+        for layer_id in range(cfg.n_layers):
+            if cfg.index_skip_topk_offset > 0:
+                index = max(layer_id - cfg.index_skip_topk_offset + 1, 0)
+            else:
+                index = max(layer_id - 1, 0)
+            reuse.append(index % cfg.index_topk_freq != 0)
+    else:
+        return decisions
+
+    if reuse and reuse[0]:
+        raise ValueError("the first DSA layer cannot reuse an absent Top-K")
+    decisions = [
+        (reuse[layer_id], not reuse[layer_id] and layer_id + 1 < cfg.n_layers
+         and reuse[layer_id + 1])
+        for layer_id in range(cfg.n_layers)
+    ]
+    return decisions
 
 
 class W8A8StaticLinear(nn.Module):
@@ -313,16 +390,27 @@ class W8A8StaticLinear(nn.Module):
         self.register_buffer(
             "input_offset", torch.empty(1, dtype=torch.bfloat16, device=device)
         )
+        self.register_buffer(
+            "input_offset_fp32",
+            torch.empty(1, dtype=torch.float32, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "input_scale_recip",
+            torch.empty(1, dtype=torch.float32, device=device),
+            persistent=False,
+        )
 
     def process_weights_after_loading(self) -> None:
         self.weight.data = self.weight.data.transpose(0, 1).contiguous()
-        self.input_scale_recip = (1.0 / self.input_scale).to(torch.float32)
+        self.input_scale_recip.copy_(1.0 / self.input_scale)
+        self.input_offset_fp32.copy_(self.input_offset)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         mult = self.input_scale_recip
         x_int8 = torch.clamp(
             torch.round(
-                x.to(torch.float32) * mult + self.input_offset.to(torch.float32)
+                x.to(torch.float32) * mult + self.input_offset_fp32
             ),
             -128, 127,
         ).to(torch.int8)
@@ -330,6 +418,23 @@ class W8A8StaticLinear(nn.Module):
             x_int8, self.weight, False, self.deq_scale, None, None,
             self.quant_bias if not (self.row_parallel and ops.tp_rank(x.device) != 0) else None,
             torch.bfloat16,
+        )
+
+    def forward_with_rms_norm(
+        self, x: torch.Tensor, norm_weight: torch.Tensor, eps: float
+    ) -> torch.Tensor:
+        """Run the static projection and following RMSNorm in one C++ call."""
+        if x.device.type not in ("npu", "privateuseone"):
+            return ops.rms_norm(self.forward(x), norm_weight, eps)
+        return ops.static_quant_matmul_rms_norm(
+            x,
+            self.weight,
+            self.deq_scale,
+            self.quant_bias,
+            self.input_scale_recip,
+            self.input_offset_fp32,
+            norm_weight,
+            eps,
         )
 
 
@@ -415,6 +520,8 @@ class DeepseekV3MLAAttention(Attention):
         layer_id: int,
         dtype: torch.dtype,
         device: torch.device,
+        reuse_topk: bool = False,
+        output_topk: bool = False,
     ) -> None:
         tp = cfg.tp_size
         assert cfg.n_heads % tp == 0
@@ -442,6 +549,9 @@ class DeepseekV3MLAAttention(Attention):
         self.v_head_dim = v_head
         self.kv_lora_rank = kv_lora
         self.num_heads_local = num_heads
+        self.reuse_topk = reuse_topk
+        self.output_topk = output_topk
+        self.last_topk: torch.Tensor | None = None
 
         self.q_a_proj = W8A8StaticLinear(cfg.hidden_size, cfg.q_lora_rank, device)
         self.kv_a_proj_with_mqa = W8A8StaticLinear(cfg.hidden_size, kv_lora + qk_rope, device)
@@ -511,28 +621,28 @@ class DeepseekV3MLAAttention(Attention):
     def _interleaved_rope(
         self, x: torch.Tensor, positions: torch.Tensor
     ) -> torch.Tensor:
-        cos_sin = self.rotary.cos_sin_cache[positions]
-        half = cos_sin.size(-1) // 2
-        cos32 = cos_sin[..., :half]
-        sin32 = cos_sin[..., half:]
-        cos = torch.cat([cos32, cos32], dim=-1).unsqueeze(1).unsqueeze(1)
-        sin = torch.cat([sin32, sin32], dim=-1).unsqueeze(1).unsqueeze(1)
-        T, H, D = x.shape
-        return torch_npu.npu_interleave_rope(
-            x.view(T, H, 1, D), cos, sin
-        ).view(T, H, D)
+        return _apply_interleaved_rope(x, positions, self.rotary)
 
     def forward(
-        self, hidden: torch.Tensor, positions: torch.Tensor
+        self,
+        hidden: torch.Tensor,
+        positions: torch.Tensor,
+        topk_state: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_tokens = hidden.shape[0]
-        q_a = self.q_a_proj(hidden)
-        q_c = self.q_a_layernorm(q_a)
+        q_c = self.q_a_proj.forward_with_rms_norm(
+            hidden, self.q_a_layernorm.weight, self.q_a_layernorm.eps
+        )
         backend = get_forward_context().attention_backend
         topk = None
-        if self.indexer is not None:
+        if self.reuse_topk:
+            if topk_state is None:
+                raise RuntimeError("DSA Top-K reuse state is not initialized")
+            topk = topk_state
+        elif self.indexer is not None:
             ctx = backend.mla_index_context(self)
             topk = self.indexer.select_qli(hidden, q_c, positions, ctx)
+        self.last_topk = topk if self.output_topk else None
         q = self.q_b_proj(q_c)
         q = q.view(
             num_tokens,
@@ -609,23 +719,12 @@ class DeepseekV3Indexer(nn.Module):
         k_pe, k_nope = torch.split(
             k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
         )
-        cos_sin = self.rotary.cos_sin_cache[positions]
-        half = cos_sin.size(-1) // 2
-        c = cos_sin[:, :half]
-        s = cos_sin[:, half:]
-        q1 = q_pe[..., :half]; q2 = q_pe[..., half:]
-        o1 = q1 * c.unsqueeze(1) - q2 * s.unsqueeze(1)
-        o2 = q2 * c.unsqueeze(1) + q1 * s.unsqueeze(1)
-        q_pe = torch.cat([o1, o2], dim=-1)
-        k1 = k_pe[..., :half]; k2 = k_pe[..., half:]
-        ko1 = k1 * c - k2 * s
-        ko2 = k2 * c + k1 * s
-        k_pe = torch.cat([ko1, ko2], dim=-1)
+        q_pe = _apply_interleaved_rope(q_pe, positions, self.rotary)
+        k_pe = _apply_interleaved_rope(
+            k_pe.unsqueeze(1), positions, self.rotary
+        ).squeeze(1)
         q = torch.cat([q_pe, q_nope], dim=-1)
         k = torch.cat([k_pe, k_nope], dim=-1)
-        if ctx.index_cache is not None and ctx.slot_mapping is not None:
-            ctx.update_index_cache(k)
-
         key_head_num = ctx.index_cache.size(2) if ctx.index_cache.dim() >= 3 else 1
         output_shape = (q.size(0), key_head_num, self.topk)
         buffer_key = tuple(output_shape)
@@ -641,6 +740,7 @@ class DeepseekV3Indexer(nn.Module):
                 output_shape, dtype=q.dtype, device=q.device
             ),
         )
+        ctx.update_index_cache(k)
         topk = ops.lightning_indexer_out(
             q, ctx.index_cache, weights,
             ctx.actual_seq_q, ctx.actual_seq_kv, ctx.block_table,
@@ -681,6 +781,11 @@ class DeepseekV3MoE(nn.Module):
         self.register_buffer(
             "e_score_correction_bias",
             torch.zeros(self.num_experts, dtype=torch.float32, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "e_score_correction_bias_compute",
+            torch.empty(self.num_experts, dtype=dtype, device=device),
             persistent=False,
         )
         self.experts_w13 = nn.Parameter(
@@ -725,6 +830,14 @@ class DeepseekV3MoE(nn.Module):
                 dtype=torch.float32, device=device,
             ),
         )
+        self.register_buffer(
+            "experts_w2_scale_bf16",
+            torch.empty(
+                self.num_experts, self.hidden,
+                dtype=torch.bfloat16, device=device,
+            ),
+            persistent=False,
+        )
         shared_inter = cfg.moe_intermediate_size * cfg.n_shared_experts
         self.shared_experts = DeepseekV3MLP(cfg, shared_inter, dtype, device,
                                             skip_tp_reduce=True)
@@ -736,6 +849,7 @@ class DeepseekV3MoE(nn.Module):
         assert torch.all(self.experts_w2_offset == 0), (
             "DeepseekV3MoE int8-grouped path needs symmetric int8 experts "
             "(experts_w2_offset == 0)")
+        self.e_score_correction_bias_compute.copy_(self.e_score_correction_bias)
         self.experts_w13.data = self.experts_w13.data.transpose(1, 2).contiguous()
         self.experts_w2.data = self.experts_w2.data.transpose(1, 2).contiguous()
         self.experts_w13.data = torch_npu.npu_format_cast(
@@ -751,6 +865,7 @@ class DeepseekV3MoE(nn.Module):
         self.experts_w2_scale.data = self.experts_w2_scale.data.view(
             self.num_experts, -1
         ).contiguous()
+        self.experts_w2_scale_bf16.copy_(self.experts_w2_scale)
         self.experts_w2_offset.data = self.experts_w2_offset.data.view(
             self.num_experts, -1
         ).contiguous()
@@ -760,9 +875,7 @@ class DeepseekV3MoE(nn.Module):
         self, gating_output: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """noaux_tc groupwise top-k via ``npu_moe_gating_top_k``."""
-        bias = self.e_score_correction_bias
-        if bias is not None and bias.dtype != gating_output.dtype:
-            bias = bias.to(gating_output.dtype)
+        bias = self.e_score_correction_bias_compute
         topk_weights, topk_ids, _ = torch_npu.npu_moe_gating_top_k(
             gating_output,
             k=self.topk,
@@ -805,7 +918,7 @@ class DeepseekV3MoE(nn.Module):
 
         out = torch.ops.npu.npu_grouped_matmul(
             x=[act_i8], weight=[self.experts_w2],
-            scale=[self.experts_w2_scale.to(torch.bfloat16)],
+            scale=[self.experts_w2_scale_bf16],
             per_token_scale=[act_pt],
             split_item=2, group_list_type=0, group_type=0,
             group_list=group_list, output_dtype=torch.bfloat16)[0]
@@ -830,13 +943,24 @@ class DeepseekV3DecoderLayer(nn.Module):
         layer_id: int,
         dtype: torch.dtype,
         device: torch.device,
+        dsa_topk_share_decision: tuple[bool, bool] | None = None,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
+        if dsa_topk_share_decision is None:
+            dsa_topk_share_decision = _dsa_topk_share_decisions(cfg)[layer_id]
+        reuse_topk, output_topk = dsa_topk_share_decision
         self.input_layernorm = RMSNorm(
             cfg.hidden_size, cfg.rms_norm_eps, dtype=dtype, device=device
         )
-        self.self_attn = DeepseekV3MLAAttention(cfg, layer_id, dtype, device)
+        self.self_attn = DeepseekV3MLAAttention(
+            cfg,
+            layer_id,
+            dtype,
+            device,
+            reuse_topk=reuse_topk,
+            output_topk=output_topk,
+        )
         self.post_attention_layernorm = RMSNorm(
             cfg.hidden_size, cfg.rms_norm_eps, dtype=dtype, device=device
         )
@@ -852,13 +976,14 @@ class DeepseekV3DecoderLayer(nn.Module):
         hidden: torch.Tensor,
         residual: Optional[torch.Tensor],
         positions: torch.Tensor,
+        topk_state: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             residual = hidden
             hidden = self.input_layernorm(hidden)
         else:
             hidden, residual = self.input_layernorm(hidden, residual)
-        hidden = self.self_attn(hidden, positions)
+        hidden = self.self_attn(hidden, positions, topk_state)
         hidden, residual = self.post_attention_layernorm(hidden, residual)
         hidden = self.mlp(hidden)
         return hidden, residual
@@ -872,6 +997,7 @@ class DeepseekV3Model(nn.Module):
         tp = cfg.tp_size
         assert cfg.hidden_size % tp == 0
         self.cfg = cfg
+        dsa_topk_share_decisions = _dsa_topk_share_decisions(cfg)
         self.embed_tokens = HiddenParallelEmbedding(
             cfg.vocab_size,
             cfg.hidden_size // tp,
@@ -881,7 +1007,13 @@ class DeepseekV3Model(nn.Module):
         )
         self.layers = nn.ModuleList(
             [
-                DeepseekV3DecoderLayer(cfg, i, dtype, device)
+                DeepseekV3DecoderLayer(
+                    cfg,
+                    i,
+                    dtype,
+                    device,
+                    dsa_topk_share_decision=dsa_topk_share_decisions[i],
+                )
                 for i in range(cfg.n_layers)
             ]
         )
@@ -895,8 +1027,14 @@ class DeepseekV3Model(nn.Module):
         hidden = self.embed_tokens(input_ids)
         positions = positions.to(torch.int64).contiguous()
         residual: Optional[torch.Tensor] = None
+        topk_state: torch.Tensor | None = None
+        layer_synchronizer = get_forward_context().layer_synchronizer
         for layer in self.layers:
-            hidden, residual = layer(hidden, residual, positions)
+            hidden, residual = layer(hidden, residual, positions, topk_state)
+            if layer.self_attn.output_topk:
+                topk_state = layer.self_attn.last_topk
+            if layer_synchronizer is not None:
+                layer_synchronizer.record_event(layer.layer_id)
         hidden, last_hidden = self.norm(hidden, residual)
         return hidden
 

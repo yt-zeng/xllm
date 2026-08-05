@@ -78,6 +78,24 @@ class AttentionMetadataView final {
   py::object kv_seq_lens() const {
     return optional_tensor(metadata_->kv_seq_lens);
   }
+  py::object q_seq_lens() const {
+    return optional_tensor(metadata_->q_seq_lens);
+  }
+  bool use_expanded_decode_for_spec_verify_attention() const {
+    return metadata_->use_expanded_decode_for_spec_verify_attention;
+  }
+  py::object expanded_kv_seq_lens() const {
+    return optional_tensor(metadata_->expanded_kv_seq_lens);
+  }
+  py::object expanded_block_table() const {
+    return optional_tensor(metadata_->expanded_block_table);
+  }
+  py::object expanded_paged_attention_tiling_data() const {
+    return optional_tensor(metadata_->expanded_paged_attention_tiling_data);
+  }
+  py::object expanded_kv_seq_lens_host() const {
+    return optional_tensor(metadata_->expanded_kv_seq_lens_host);
+  }
   bool is_prefill() const { return metadata_->is_prefill; }
   bool is_chunked_prefill() const { return metadata_->is_chunked_prefill; }
 
@@ -125,6 +143,19 @@ PYBIND11_EMBEDDED_MODULE(xllm_runtime, m) {
                              &AttentionMetadataView::kv_seq_lens_host)
       .def_property_readonly("block_table", &AttentionMetadataView::block_table)
       .def_property_readonly("kv_seq_lens", &AttentionMetadataView::kv_seq_lens)
+      .def_property_readonly("q_seq_lens", &AttentionMetadataView::q_seq_lens)
+      .def_property_readonly(
+          "use_expanded_decode_for_spec_verify_attention",
+          &AttentionMetadataView::use_expanded_decode_for_spec_verify_attention)
+      .def_property_readonly("expanded_kv_seq_lens",
+                             &AttentionMetadataView::expanded_kv_seq_lens)
+      .def_property_readonly("expanded_block_table",
+                             &AttentionMetadataView::expanded_block_table)
+      .def_property_readonly(
+          "expanded_paged_attention_tiling_data",
+          &AttentionMetadataView::expanded_paged_attention_tiling_data)
+      .def_property_readonly("expanded_kv_seq_lens_host",
+                             &AttentionMetadataView::expanded_kv_seq_lens_host)
       .def_property_readonly("is_prefill", &AttentionMetadataView::is_prefill)
       .def_property_readonly("is_chunked_prefill",
                              &AttentionMetadataView::is_chunked_prefill);

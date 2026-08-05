@@ -102,6 +102,23 @@ class NpuPagedAttentionBackend(AttentionBackend):
     def bind_kv_caches(self, kv_caches: list[KVCache]) -> None:
         self._kv_caches = kv_caches
 
+    @staticmethod
+    def _query_sequence_ends(
+        q_cu_seq_lens: torch.Tensor | None,
+        batch_size: int,
+    ) -> torch.Tensor | None:
+        """Accept both NPU q-cumulative layouts used by the runtime."""
+        if q_cu_seq_lens is None:
+            return None
+        if q_cu_seq_lens.numel() == batch_size:
+            return q_cu_seq_lens.to(torch.int32)
+        if q_cu_seq_lens.numel() == batch_size + 1:
+            return q_cu_seq_lens[1:].to(torch.int32)
+        raise RuntimeError(
+            "q cumulative sequence lengths must contain either one value per "
+            "sequence or a leading zero plus one value per sequence"
+        )
+
     def prepare(
         self,
         metadata: AttentionMetadata,
@@ -109,14 +126,67 @@ class NpuPagedAttentionBackend(AttentionBackend):
         graph_mode: bool = False,
     ) -> None:
         self._metadata = metadata
-        if metadata.q_cu_seq_lens is not None:
-            self._actual_seq_lens: list[int] | None = (
-                metadata.q_cu_seq_lens[1:].cpu().tolist()
+        use_expanded_decode = bool(
+            getattr(
+                metadata,
+                "use_expanded_decode_for_spec_verify_attention",
+                False,
             )
+        )
+        expanded_kv_seq_lens = getattr(
+            metadata, "expanded_kv_seq_lens", None
+        )
+        expanded_kv_seq_lens_host = getattr(
+            metadata, "expanded_kv_seq_lens_host", None
+        )
+        expanded_block_table = getattr(metadata, "expanded_block_table", None)
+        if use_expanded_decode:
+            if expanded_kv_seq_lens is None or expanded_block_table is None:
+                raise RuntimeError(
+                    "expanded decode metadata is incomplete"
+                )
+            block_table = expanded_block_table.to(torch.int32)
+            kv_host = expanded_kv_seq_lens_host
+            if kv_host is None and not self._is_mla:
+                kv_host = expanded_kv_seq_lens.cpu()
+            elif kv_host is not None:
+                kv_host = kv_host.cpu()
+            real_batch = block_table.shape[0]
+            if kv_host is not None and kv_host.numel() != real_batch:
+                raise RuntimeError(
+                    "expanded KV lengths must have one entry per block-table row"
+                )
+            # ``expanded_kv_seq_lens`` is per expanded query row, not a
+            # cumulative query-length tensor. Keep the C++-provided values;
+            # synthesizing 1..batch loses the actual KV-cache extent.
+            expanded_lengths = (
+                kv_host
+                if kv_host is not None
+                else expanded_kv_seq_lens.detach().to(torch.int32).cpu()
+            )
+            self._actual_seq_lens = expanded_lengths.tolist()
+        elif metadata.q_cu_seq_lens is not None:
+            q_seq_lens = getattr(metadata, "q_seq_lens", None)
+            if q_seq_lens is not None:
+                batch_size = q_seq_lens.numel()
+            elif metadata.block_table is not None:
+                batch_size = metadata.block_table.shape[0]
+            else:
+                # All runtime-created metadata carries q_seq_lens.  Keep a
+                # defensive fallback for lightweight test metadata whose
+                # cumulative tensor already includes its leading zero.
+                batch_size = max(metadata.q_cu_seq_lens.numel() - 1, 0)
+            q_seq_ends = self._query_sequence_ends(
+                metadata.q_cu_seq_lens,
+                batch_size,
+            )
+            self._actual_seq_lens = q_seq_ends.cpu().tolist()
         else:
             self._actual_seq_lens = None
 
-        if metadata.block_table is not None:
+        if use_expanded_decode:
+            self._block_table_i32 = block_table
+        elif metadata.block_table is not None:
             self._block_table_i32 = metadata.block_table.to(torch.int32)
 
             real_batch = metadata.block_table.shape[0]
@@ -137,6 +207,13 @@ class NpuPagedAttentionBackend(AttentionBackend):
             self._actual_seq_kv: list[int] = kv_list
         else:
             self._block_table_i32 = None
+
+        if use_expanded_decode:
+            self._actual_seq_q = list(range(1, real_batch + 1))
+            if kv_host is not None:
+                self._actual_seq_kv = kv_host.to(torch.int32).tolist()
+            else:
+                self._actual_seq_kv = []
 
         if (
             graph_mode
@@ -188,13 +265,24 @@ class NpuPagedAttentionBackend(AttentionBackend):
 
         # Pre-cache MLA (sparse SFA) seq-lens once per step; shared by
         # execute_mla / mla_index_context instead of re-derived per layer.
-        if metadata.kv_seq_lens is not None:
+        if use_expanded_decode:
+            kv_seq_lens = expanded_kv_seq_lens
+        else:
             kv_seq_lens = metadata.kv_seq_lens
+        if kv_seq_lens is not None:
             mla_device = kv_seq_lens.device
             actual_seq_kv = kv_seq_lens.to(torch.int32).to(mla_device)
-            if metadata.q_cu_seq_lens is not None:
-                actual_seq_q = metadata.q_cu_seq_lens[1:].to(
-                    torch.int32
+            if use_expanded_decode:
+                actual_seq_q = torch.arange(
+                    1,
+                    actual_seq_kv.numel() + 1,
+                    dtype=torch.int32,
+                    device=mla_device,
+                )
+            elif metadata.q_cu_seq_lens is not None:
+                actual_seq_q = self._query_sequence_ends(
+                    metadata.q_cu_seq_lens,
+                    int(actual_seq_kv.numel()),
                 ).to(mla_device)
             else:
                 batch = kv_seq_lens.size(0)
@@ -244,6 +332,14 @@ class NpuPagedAttentionBackend(AttentionBackend):
         q_3d = q.view(num_tokens, self.num_heads, self.head_dim).contiguous()
 
         if metadata.is_prefill or metadata.is_chunked_prefill:
+            if bool(
+                getattr(
+                    metadata,
+                    "use_expanded_decode_for_spec_verify_attention",
+                    False,
+                )
+            ):
+                return self._decode(q_3d, k_cache, v_cache, metadata, num_tokens)
             return self._prefill(q_3d, k_3d, v_3d, metadata, num_tokens)
         return self._decode(q_3d, k_cache, v_cache, metadata, num_tokens)
 
@@ -276,7 +372,13 @@ class NpuPagedAttentionBackend(AttentionBackend):
             nope_cache,
             rope_cache,
             topk,
-            metadata.block_table,
+            getattr(metadata, "expanded_block_table", None)
+            if getattr(
+                metadata,
+                "use_expanded_decode_for_spec_verify_attention",
+                False,
+            )
+            else metadata.block_table,
             layer_id,
         )
 
@@ -287,7 +389,15 @@ class NpuPagedAttentionBackend(AttentionBackend):
         return MlaIndexContext(
             index_cache=index_cache,
             slot_mapping=metadata.slot_mapping,
-            block_table=metadata.block_table,
+            block_table=(
+                getattr(metadata, "expanded_block_table", None)
+                if getattr(
+                    metadata,
+                    "use_expanded_decode_for_spec_verify_attention",
+                    False,
+                )
+                else metadata.block_table
+            ),
             actual_seq_q=self._mla_actual_seq_q,
             actual_seq_kv=self._mla_actual_seq_kv,
             update_index_cache=lambda values: self._update_mla_index_cache(
@@ -302,9 +412,14 @@ class NpuPagedAttentionBackend(AttentionBackend):
         values: torch.Tensor,
     ) -> None:
         cache_view = index_cache.view(-1, index_cache.size(-1))
+        safe_slots = slot_mapping.reshape(-1, 1).clamp_min(0)
+        safe_slot_indices = safe_slots.to(torch.long).expand_as(values)
+        existing_values = cache_view.gather(0, safe_slot_indices)
+        valid_rows = slot_mapping.reshape(-1, 1).ge(0)
+        values = torch.where(valid_rows, values, existing_values)
         ops.scatter_nd_update(
             cache_view,
-            slot_mapping.reshape(-1, 1).clamp_min(0),
+            safe_slots,
             values,
         )
 

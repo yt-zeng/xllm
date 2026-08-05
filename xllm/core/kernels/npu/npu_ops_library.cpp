@@ -22,6 +22,7 @@ limitations under the License.
 // underlying NPU kernel API. Data preparation (reshaping, dtype alignment)
 // belongs in the Python caller, not here.
 
+#include <glog/logging.h>
 #include <torch/library.h>
 #include <torch/torch.h>
 
@@ -50,6 +51,38 @@ std::tuple<torch::Tensor, torch::Tensor> fused_add_rms_norm_npu(
 
 torch::Tensor silu_and_mul_npu(const torch::Tensor& input) {
   return xllm::kernel::npu::active(input, "swiglu");
+}
+
+torch::Tensor static_quant_matmul_rms_norm_npu(
+    const torch::Tensor& input,
+    const torch::Tensor& weight,
+    const torch::Tensor& deq_scale,
+    const torch::Tensor& quant_bias,
+    const torch::Tensor& input_scale_recip,
+    const torch::Tensor& input_offset,
+    const torch::Tensor& norm_weight,
+    double eps) {
+  CHECK_EQ(input_scale_recip.numel(), 1)
+      << "input_scale_recip must be a scalar tensor";
+  CHECK_EQ(input_offset.numel(), 1)
+      << "input_offset must be a scalar tensor";
+
+  torch::Tensor quantized = torch::clamp(
+                                torch::round(input.to(torch::kFloat32) *
+                                              input_scale_recip + input_offset),
+                                -128,
+                                127)
+                                .to(torch::kInt8);
+  torch::Tensor projected = xllm::kernel::npu::quant_matmul(
+      quantized,
+      weight,
+      false,
+      deq_scale,
+      std::nullopt,
+      std::nullopt,
+      quant_bias,
+      torch::kBFloat16);
+  return xllm::kernel::npu::rms_norm(projected, norm_weight, eps, "rmsnorm");
 }
 
 torch::Tensor reshape_paged_cache_npu(const torch::Tensor& slot_mapping,
@@ -91,43 +124,76 @@ torch::Tensor update_decode_graph_metadata_npu(
     torch::Tensor& dst_paged_kv_indices,
     torch::Tensor& dst_paged_kv_last_page_len,
     int64_t padded_num_tokens) {
-  const int64_t n = tokens.size(0);
+  CHECK(tokens.defined()) << "tokens must be defined";
+  const int64_t n = tokens.numel();
   const int64_t p = padded_num_tokens;
+  const int64_t actual_batch_size = paged_kv_last_page_len.numel();
+  const int64_t num_pages = paged_kv_indices.numel();
 
-  dst_tokens.slice(0, 0, n).copy_(tokens);
-  dst_positions.slice(0, 0, n).copy_(positions);
-  dst_slot_mapping.slice(0, 0, n).copy_(slot_mapping);
+  CHECK_EQ(tokens.dim(), 1) << "tokens must be one-dimensional";
+  CHECK_EQ(positions.numel(), n)
+      << "positions must contain one entry per token";
+  CHECK_EQ(slot_mapping.numel(), n)
+      << "slot_mapping must contain one entry per token";
+  CHECK_EQ(actual_batch_size, n)
+      << "decode graph requires one token per sequence";
+  CHECK_GE(p, n) << "padded_num_tokens must be >= actual token count";
+  CHECK_EQ(kv_seq_lens.numel(), actual_batch_size + 1)
+      << "kv_seq_lens must contain cumulative lengths";
+  CHECK_EQ(paged_kv_indptr.numel(), actual_batch_size + 1)
+      << "paged_kv_indptr must contain one entry per sequence plus a sentinel";
+  CHECK_GE(dst_tokens.numel(), p);
+  CHECK_GE(dst_positions.numel(), p);
+  CHECK_GE(dst_slot_mapping.numel(), p);
+  CHECK_GE(dst_kv_seq_lens.numel(), p + 1);
+  CHECK_GE(dst_kv_seq_lens_delta.numel(), p);
+  CHECK_GE(dst_paged_kv_indptr.numel(), p + 1);
+  CHECK_GE(dst_paged_kv_indices.numel(), num_pages);
+  CHECK_GE(dst_paged_kv_last_page_len.numel(), p);
+
+  dst_tokens.slice(0, 0, n).copy_(tokens, /*non_blocking=*/true);
+  dst_positions.slice(0, 0, n).copy_(positions, /*non_blocking=*/true);
+  dst_slot_mapping.slice(0, 0, n).copy_(slot_mapping,
+                                        /*non_blocking=*/true);
   if (p > n) {
     dst_tokens.slice(0, n, p).zero_();
     dst_positions.slice(0, n, p).zero_();
     dst_slot_mapping.slice(0, n, p).fill_(-1);
   }
 
-  const int64_t src_len = std::min<int64_t>(kv_seq_lens.size(0), n + 1);
-  dst_kv_seq_lens.slice(0, 0, src_len).copy_(kv_seq_lens.slice(0, 0, src_len));
-  if (p >= n) {
-    dst_kv_seq_lens.slice(0, src_len, p + 1)
-        .copy_(kv_seq_lens.slice(0, src_len - 1, src_len));
+  dst_kv_seq_lens.slice(0, 0, actual_batch_size + 1)
+      .copy_(kv_seq_lens, /*non_blocking=*/true);
+  if (p > actual_batch_size) {
+    const int64_t padding_size = p - actual_batch_size;
+    torch::Tensor last_kv_seq_len =
+        kv_seq_lens.slice(0, actual_batch_size, actual_batch_size + 1)
+            .repeat({padding_size});
+    dst_kv_seq_lens.slice(0, actual_batch_size + 1, p + 1)
+        .copy_(last_kv_seq_len, /*non_blocking=*/true);
   }
   dst_kv_seq_lens_delta.slice(0, 0, p).copy_(
-      dst_kv_seq_lens.slice(0, 1, p + 1) - dst_kv_seq_lens.slice(0, 0, p));
+      dst_kv_seq_lens.slice(0, 1, p + 1) - dst_kv_seq_lens.slice(0, 0, p),
+      /*non_blocking=*/true);
 
-  const int64_t indptr_len = std::min<int64_t>(paged_kv_indptr.size(0), n + 1);
-  dst_paged_kv_indptr.slice(0, 0, indptr_len)
-      .copy_(paged_kv_indptr.slice(0, 0, indptr_len));
-  if (p >= n) {
-    dst_paged_kv_indptr.slice(0, indptr_len, p + 1)
-        .copy_(paged_kv_indptr.slice(0, indptr_len - 1, indptr_len));
+  dst_paged_kv_indptr.slice(0, 0, actual_batch_size + 1)
+      .copy_(paged_kv_indptr, /*non_blocking=*/true);
+  if (p > actual_batch_size) {
+    const int64_t padding_size = p - actual_batch_size;
+    torch::Tensor last_page_index =
+        paged_kv_indptr.slice(0, actual_batch_size, actual_batch_size + 1)
+            .repeat({padding_size});
+    dst_paged_kv_indptr.slice(0, actual_batch_size + 1, p + 1)
+        .copy_(last_page_index, /*non_blocking=*/true);
   }
 
   dst_paged_kv_last_page_len.slice(0, 0, n).copy_(
-      paged_kv_last_page_len.slice(0, 0, n));
+      paged_kv_last_page_len.slice(0, 0, n), /*non_blocking=*/true);
   if (p > n) {
     dst_paged_kv_last_page_len.slice(0, n, p).fill_(1);
   }
 
-  const int64_t num_pages = paged_kv_indices.size(0);
-  dst_paged_kv_indices.slice(0, 0, num_pages).copy_(paged_kv_indices);
+  dst_paged_kv_indices.slice(0, 0, num_pages)
+      .copy_(paged_kv_indices, /*non_blocking=*/true);
 
   return dst_tokens;
 }
@@ -150,6 +216,10 @@ TORCH_LIBRARY(xllm_ops, m) {
       "weight, "
       "float eps) -> (Tensor, Tensor)");
   m.def("silu_and_mul(Tensor input) -> Tensor");
+  m.def(
+      "static_quant_matmul_rms_norm(Tensor input, Tensor weight, Tensor "
+      "deq_scale, Tensor quant_bias, Tensor input_scale_recip, Tensor input_offset, Tensor "
+      "norm_weight, float eps) -> Tensor");
   m.def(
       "fused_qk_norm_rope(Tensor(a!) qkv, int num_heads_q, int num_heads_k, "
       "int "
@@ -191,8 +261,8 @@ TORCH_LIBRARY(xllm_ops, m) {
       "Tensor? query_seq_lengths, Tensor? key_seq_lengths, Tensor? "
       "block_table, str layout_query, str layout_key, int selected_count, "
       "int sparse_mode, int pre_tokens, int next_tokens, bool return_value, "
-      "Tensor(a!) sparse_indices_out, Tensor(b!) sparse_values_out) -> "
-      "Tensor(a!)");
+       "Tensor(a!) sparse_indices_out, Tensor(b!) sparse_values_out) -> "
+       "Tensor(a!)");
   m.def(
       "scatter_nd_update(Tensor(a!) var, Tensor indices, Tensor updates) -> "
       "()");
@@ -215,6 +285,8 @@ TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
   m.impl("rms_norm", TORCH_FN(xllm::rms_norm_npu));
   m.impl("fused_add_rms_norm", TORCH_FN(xllm::fused_add_rms_norm_npu));
   m.impl("silu_and_mul", TORCH_FN(xllm::silu_and_mul_npu));
+  m.impl("static_quant_matmul_rms_norm",
+         TORCH_FN(xllm::static_quant_matmul_rms_norm_npu));
   m.impl("reshape_paged_cache", TORCH_FN(xllm::reshape_paged_cache_npu));
   m.impl("apply_rotary_embedding", TORCH_FN(xllm::apply_rotary_embedding_npu));
   m.impl("update_decode_graph_metadata",
@@ -223,7 +295,6 @@ TORCH_LIBRARY_IMPL(xllm_ops, PrivateUse1, m) {
   m.impl("quantize_per_tensor",
          TORCH_FN(xllm::kernel::npu::quantize_per_tensor));
   m.impl("dynamic_quant", TORCH_FN(xllm::kernel::npu::dynamic_quant));
-  m.impl("lightning_indexer", TORCH_FN(xllm::kernel::npu::lightning_indexer));
   m.impl("lightning_indexer_out",
          TORCH_FN(xllm::kernel::npu::lightning_indexer_out));
   m.impl("scatter_nd_update", TORCH_FN(xllm::kernel::npu::scatter_nd_update));

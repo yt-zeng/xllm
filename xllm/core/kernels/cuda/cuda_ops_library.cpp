@@ -234,6 +234,12 @@ TORCH_LIBRARY(xllm_ops, m) {
       "weight, "
       "float eps) -> (Tensor, Tensor)");
   m.def("silu_and_mul(Tensor input) -> Tensor");
+  // Keep the schema available in CUDA builds so the shared Python op module
+  // can be imported. DeepSeek-V3.2 dispatches this op only on NPU.
+  m.def(
+      "static_quant_matmul_rms_norm(Tensor input, Tensor weight, Tensor "
+      "deq_scale, Tensor quant_bias, Tensor input_scale_recip, Tensor input_offset, Tensor "
+      "norm_weight, float eps) -> Tensor");
   m.def(
       "fused_qk_norm_rope(Tensor(a!) qkv, int num_heads_q, int num_heads_k, "
       "int "

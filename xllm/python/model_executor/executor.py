@@ -122,16 +122,27 @@ class ModelExecutor:
                 int(config["max_position_embeddings"]),
             )
         elif graph_backend == "aclgraph":
-            from xllm.python.model_executor.runners.decode_acl_graph import (
-                DecodeAclGraphRunner,
-            )
-            self.decode_graph_runner = DecodeAclGraphRunner(
-                execution_model,
-                self.attention_backend,
-                device,
-                max_seqs_per_batch,
-                int(config["max_position_embeddings"]),
-            )
+            # A one-layer MTP draft body follows the native executor policy:
+            # graph capture overhead is larger than its launch savings.  Keep
+            # it on the eager runner instead of sending it to an inductor
+            # backend named "aclgraph".
+            if self._num_attention_layers > 1:
+                graph_batch_limit = int(
+                    config.get(
+                        "acl_graph_decode_batch_size_limit", max_seqs_per_batch
+                    )
+                )
+                graph_batch_limit = max(1, graph_batch_limit)
+                from xllm.python.model_executor.runners.decode_acl_graph import (
+                    DecodeAclGraphRunner,
+                )
+                self.decode_graph_runner = DecodeAclGraphRunner(
+                    execution_model,
+                    self.attention_backend,
+                    device,
+                    min(max_seqs_per_batch, graph_batch_limit),
+                    int(config["max_position_embeddings"]),
+                )
         else:
             from xllm.python.model_executor.runners.inductor import InductorRunner
             self.inductor_runner = InductorRunner(
@@ -170,8 +181,12 @@ class ModelExecutor:
             raise RuntimeError("KV caches are not bound")
 
         graph_runner = self.decode_graph_runner
-        if graph_runner is not None and graph_runner.can_execute(
-            input_ids, metadata, input_embedding
+        if (
+            layer_synchronizer is None
+            and graph_runner is not None
+            and graph_runner.can_execute(
+                input_ids, metadata, input_embedding
+            )
         ):
             graph_runner.warmup(
                 input_ids.device, input_ids.dtype, input_embedding

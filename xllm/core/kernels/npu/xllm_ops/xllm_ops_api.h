@@ -227,6 +227,7 @@ torch::Tensor lightning_indexer_out(
     bool return_value,
     torch::Tensor& sparse_indices_out,
     torch::Tensor& sparse_values_out);
+
 at::Tensor hc_pre_inv_rms(const at::Tensor& x, double epsilon);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> gamma_add_rms_norm(

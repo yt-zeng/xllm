@@ -33,6 +33,7 @@ from xllm.python.ops.compute import (
     rms_norm,
     scatter_nd_update,
     silu_and_mul,
+    static_quant_matmul_rms_norm,
     sparse_flash_attention,
     sparse_flash_attention_out,
 )
@@ -51,6 +52,7 @@ __all__ = [
     "rms_norm",
     "fused_add_rms_norm",
     "silu_and_mul",
+    "static_quant_matmul_rms_norm",
     "fused_qk_norm_rope",
     "quant_matmul",
     "quantize_per_tensor",

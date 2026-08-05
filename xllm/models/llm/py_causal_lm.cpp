@@ -86,6 +86,8 @@ py::dict PyCausalLM::build_config_dict(
   d["enable_graph"] = ExecutionConfig::get_instance().enable_graph();
   d["python_graph_backend"] =
       ExecutionConfig::get_instance().python_graph_backend();
+  d["acl_graph_decode_batch_size_limit"] =
+      ExecutionConfig::get_instance().acl_graph_decode_batch_size_limit();
   return d;
 }
 

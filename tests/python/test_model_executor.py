@@ -246,6 +246,21 @@ class TestModelExecutorConstruction:
             assert executor.decode_graph_runner is None
             assert executor.inductor_runner is None
 
+    @patch(
+        "xllm.python.model_executor.executor._create_attention_backend",
+        return_value=StubAttentionBackend(),
+    )
+    def test_aclgraph_keeps_single_layer_model_on_eager(
+        self, _mock_backend
+    ):
+        model = _FakeModel(num_layers=1)
+        executor = ModelExecutor(
+            model, {"python_graph_backend": "aclgraph"}, max_seqs_per_batch=4
+        )
+
+        assert executor.decode_graph_runner is None
+        assert executor.inductor_runner is None
+
 
 # ---------------------------------------------------------------------------
 # Tests: ModelExecutor.bind_kv_caches
