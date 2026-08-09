@@ -20,11 +20,13 @@ limitations under the License.
 #include <pybind11/embed.h>
 #include <torch/extension.h>
 
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <vector>
 
 #include "common/metrics.h"
+#include "core/framework/config/execution_config.h"
 #include "core/layers/common/attention_metadata.h"
 #include "core/layers/common/attention_metadata_builder.h"
 #include "core/runtime/py_attention_metadata.h"
@@ -89,10 +91,18 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
   py::module_::import("xllm_runtime");
   py::module_ executor_module =
       py::module_::import("xllm.python.model_executor.executor");
+  int32_t graph_max_seqs_per_batch = options_.max_seqs_per_batch();
+#if defined(USE_NPU)
+  graph_max_seqs_per_batch = std::min(
+      graph_max_seqs_per_batch,
+      std::max<int32_t>(
+          1,
+          ExecutionConfig::get_instance().acl_graph_decode_batch_size_limit()));
+#endif
   py_executor_ =
       executor_module.attr("ModelExecutor")(py_causal_lm_->python_model(),
                                             py_causal_lm_->config_dict(),
-                                            options_.max_seqs_per_batch());
+                                            graph_max_seqs_per_batch);
 }
 
 PyExecutorImpl::~PyExecutorImpl() { clear_python_object(py_executor_); }

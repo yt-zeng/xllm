@@ -102,4 +102,8 @@ def dynamic_quant(
     )
 
 
-__all__ = ["quant_matmul", "quantize_per_tensor", "dynamic_quant"]
+__all__ = [
+    "quant_matmul",
+    "quantize_per_tensor",
+    "dynamic_quant",
+]

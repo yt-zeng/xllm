@@ -74,9 +74,12 @@ ProfileManager::ProfileManager(Engine* engine, const Options& options)
   // prediction.
 
 #if defined(USE_NPU) || defined(USE_CUDA) || defined(USE_MLU)
-  // Warmup ACL graph executor if enabled
-  if (::xllm::ExecutionConfig::get_instance().enable_graph()) {
-    if (!is_rec_multi_round_mode()) {
+  const auto& execution_config = ::xllm::ExecutionConfig::get_instance();
+  if (execution_config.enable_graph()) {
+    if (execution_config.disable_graph_warmup()) {
+      LOG(INFO) << "Graph warmup disabled by execution config; graphs will be "
+                   "captured lazily from real requests";
+    } else if (!is_rec_multi_round_mode()) {
       warmup_for_graph();
     }
   }
@@ -1168,6 +1171,14 @@ void ProfileManager::warmup_decode_for_graph() {
     max_decode_batch_size =
         std::min(max_decode_batch_size, max_concurrent_requests);
   }
+#if defined(USE_NPU)
+  const int32_t graph_decode_batch_size_limit =
+      std::max<int32_t>(1,
+                        ::xllm::ExecutionConfig::get_instance()
+                            .acl_graph_decode_batch_size_limit());
+  max_decode_batch_size =
+      std::min(max_decode_batch_size, graph_decode_batch_size_limit);
+#endif
   int32_t decode_seq_len = std::min(16, max_context_len);
 
   std::vector<int32_t> decode_batch_sizes =

@@ -68,6 +68,7 @@ def grouped_moe(
     topk_group: int,
     num_expert_groups: int,
     renormalize: bool,
+    routed_scaling_factor: float,
 ) -> torch.Tensor:
     """Route and run grouped quantized experts as one fused operator.
 
@@ -83,6 +84,8 @@ def grouped_moe(
         topk_group: Groups selected per token.
         num_expert_groups: Expert groups the router splits experts into.
         renormalize: Whether to rescale the selected weights to sum to one.
+        routed_scaling_factor: Model-specific scale applied to selected routing
+            weights before expert computation.
 
     Returns:
         Hidden states of shape ``[num_tokens, hidden_size]``.
@@ -98,7 +101,7 @@ def grouped_moe(
         group_select_mode=1,
         renorm=1 if renormalize else 0,
         norm_type=1,
-        routed_scaling_factor=1.0,
+        routed_scaling_factor=routed_scaling_factor,
         eps=1e-20,
     )
     num_tokens = hidden_states.shape[0]
@@ -155,6 +158,7 @@ def _grouped_moe_fake(
     topk_group: int,
     num_expert_groups: int,
     renormalize: bool,
+    routed_scaling_factor: float,
 ) -> torch.Tensor:
     del (
         gating_output,
@@ -167,6 +171,7 @@ def _grouped_moe_fake(
         topk_group,
         num_expert_groups,
         renormalize,
+        routed_scaling_factor,
     )
     return torch.empty_like(hidden_states)
 

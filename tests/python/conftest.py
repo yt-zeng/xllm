@@ -36,6 +36,11 @@ def _install_python_package_stub() -> None:
     package.kernels = kernels
     package.distributed = distributed
 
+    # Keep the lightweight stub compatible with the public distributed API
+    # used by Python model unit tests.  Real NPU/CUDA runs replace this stub
+    # with xllm.python.distributed.
+    distributed.tp_rank = lambda device: 0
+
     sys.modules["xllm.python"] = package
     sys.modules["xllm.python.kernels"] = kernels
     sys.modules["xllm.python.distributed"] = distributed

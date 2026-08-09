@@ -34,6 +34,7 @@ from __future__ import annotations
 from . import _custom_op  # noqa: F401
 from .activation import silu_and_mul
 from .attention import (
+    batch_matmul_transpose,
     reshape_paged_cache,
     update_decode_graph_metadata,
 )
@@ -47,7 +48,10 @@ from .gated_delta_net import (
     fused_recurrent_gated_delta_rule_packed_decode,
     resolve_gdn_prefill_backend,
 )
-from .linear import prepare_row_parallel_weight
+from .linear import (
+    prepare_quant_weight,
+    prepare_row_parallel_weight,
+)
 from .moe import (
     cutlass_fused_moe,
     fused_moe,
@@ -87,6 +91,7 @@ __all__ = [
     "silu_and_mul",
     "reshape_paged_cache",
     "update_decode_graph_metadata",
+    "batch_matmul_transpose",
     "fused_qk_norm_rope",
     "interleaved_rotary_embedding",
     "moe_fused_topk",
@@ -96,6 +101,7 @@ __all__ = [
     "prepare_grouped_moe_weights",
     "supports_cutlass_moe",
     "prepare_row_parallel_weight",
+    "prepare_quant_weight",
     "quant_matmul",
     "quantize_per_tensor",
     "dynamic_quant",

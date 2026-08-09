@@ -156,7 +156,12 @@ def _quantize_per_tensor_fake(
     axis: int,
 ) -> torch.Tensor:
     del scales, zero_points, axis
-    return self.new_empty(self.shape, dtype=dtype)
+    storage_dtype = {
+        torch.qint8: torch.int8,
+        torch.quint8: torch.uint8,
+        torch.qint32: torch.int32,
+    }.get(dtype, dtype)
+    return self.new_empty(self.shape, dtype=storage_dtype)
 
 
 def _dynamic_quant_fake(

@@ -25,4 +25,24 @@ import torch
 reshape_paged_cache = torch.ops.xllm_ops.reshape_paged_cache
 update_decode_graph_metadata = torch.ops.xllm_ops.update_decode_graph_metadata
 
-__all__ = ["reshape_paged_cache", "update_decode_graph_metadata"]
+
+def batch_matmul_transpose(
+    x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    """Batch matmul with the NPU-optimized transposed-weight kernel.
+
+    MLA's recovered value path repeatedly computes ``[H, T, L] @ [H, L, V]``.
+    The dedicated NPU operator avoids materializing a transpose and is the
+    same path used by vLLM-Ascend for ``W_UV``.
+    """
+    if x.device.type != "npu":
+        return torch.bmm(x, weight)
+    return torch.ops.npu.npu_transpose_batchmatmul(
+        x, weight, perm_y=(1, 0, 2)
+    )
+
+__all__ = [
+    "reshape_paged_cache",
+    "update_decode_graph_metadata",
+    "batch_matmul_transpose",
+]

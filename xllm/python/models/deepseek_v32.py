@@ -54,6 +54,24 @@ def _tp_rank_from_device(device: object) -> int:
     return 0
 
 
+def _prepare_quant_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Prepare an INT8 weight while keeping lightweight test stubs usable."""
+    prepare = getattr(kernels, "prepare_quant_weight", None)
+    if prepare is not None:
+        return prepare(weight)
+    return weight.transpose(0, 1).contiguous()
+
+
+def _batch_matmul_transpose(
+    x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    """Use the platform kernel, with a plain-BMM fallback for test stubs."""
+    matmul = getattr(kernels, "batch_matmul_transpose", None)
+    if matmul is not None:
+        return matmul(x, weight)
+    return torch.bmm(x, weight)
+
+
 def _yarn_get_mscale(scale: float, mscale: float) -> float:
     """YaRN magnitude scaling factor."""
     if scale <= 1:
@@ -95,16 +113,31 @@ def _yarn_linear_ramp_mask(
     return torch.clamp(linear, 0, 1)
 
 
+def _gather_half_rope_cos_sin(
+    cos_sin_cache: torch.Tensor, positions: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Gather the half-rotate RoPE angles for the current token positions."""
+    cos_sin = cos_sin_cache[positions]
+    half = cos_sin.size(-1) // 2
+    return cos_sin[..., :half], cos_sin[..., half:]
+
+
+def _expand_interleave_rope_cos_sin(
+    half_cos: torch.Tensor, half_sin: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Lay out shared half-rotate angles for ``npu_interleave_rope``."""
+    cos = torch.cat([half_cos, half_cos], dim=-1).unsqueeze(1).unsqueeze(1)
+    sin = torch.cat([half_sin, half_sin], dim=-1).unsqueeze(1).unsqueeze(1)
+    return cos, sin
+
+
 def _gather_interleave_cos_sin(
     cos_sin_cache: torch.Tensor, positions: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Gather per-token cos/sin and double for ``npu_interleave_rope``."""
-    cos_sin = cos_sin_cache[positions]
-    half = cos_sin.size(-1) // 2
-    cos32, sin32 = cos_sin[..., :half], cos_sin[..., half:]
-    cos = torch.cat([cos32, cos32], dim=-1).unsqueeze(1).unsqueeze(1)
-    sin = torch.cat([sin32, sin32], dim=-1).unsqueeze(1).unsqueeze(1)
-    return cos, sin
+    return _expand_interleave_rope_cos_sin(
+        *_gather_half_rope_cos_sin(cos_sin_cache, positions)
+    )
 
 
 def _interleave_rope_with(
@@ -118,10 +151,17 @@ def _apply_half_rope(
     cos_sin_cache: torch.Tensor, x: torch.Tensor, positions: torch.Tensor
 ) -> torch.Tensor:
     """Half-rotate RoPE (NeoX style) for ``[T, H, D]`` tensors."""
-    cos_sin = cos_sin_cache[positions]
-    half = cos_sin.size(-1) // 2
-    c = cos_sin[..., :half].unsqueeze(1)
-    s = cos_sin[..., half:].unsqueeze(1)
+    half_cos, half_sin = _gather_half_rope_cos_sin(cos_sin_cache, positions)
+    return _apply_half_rope_with_angles(x, half_cos, half_sin)
+
+
+def _apply_half_rope_with_angles(
+    x: torch.Tensor, half_cos: torch.Tensor, half_sin: torch.Tensor
+) -> torch.Tensor:
+    """Half-rotate RoPE using already-gathered per-token angles."""
+    c = half_cos.unsqueeze(1)
+    s = half_sin.unsqueeze(1)
+    half = half_cos.size(-1)
     x1 = x[..., :half]
     x2 = x[..., half:]
     return torch.cat([x1 * c - x2 * s, x2 * c + x1 * s], dim=-1)
@@ -342,6 +382,8 @@ class W8A8StaticLinear(nn.Module):
             "quant_bias", torch.empty(out_features, dtype=torch.int32, device=device)
         )
         self.register_buffer(
+            # BaseLoader converts static activation quantization parameters to
+            # BF16; aclnnQuantize requires a BF16 scale for BF16 activations.
             "input_scale", torch.empty(1, dtype=torch.bfloat16, device=device)
         )
         self.register_buffer(
@@ -349,20 +391,28 @@ class W8A8StaticLinear(nn.Module):
         )
 
     def process_weights_after_loading(self) -> None:
+        # Keep the Python path's original logical layout.  QuantMatmulV4's
+        # transpose2=False path must receive the plain transposed tensor;
+        # backend-specific format packing is not part of this model path.
         self.weight.data = self.weight.data.transpose(0, 1).contiguous()
-        self.input_scale_recip = (1.0 / self.input_scale).to(torch.float32)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        mult = self.input_scale_recip
-        x_int8 = torch.clamp(
-            torch.round(
-                x.to(torch.float32) * mult + self.input_offset.to(torch.float32)
-            ),
-            -128, 127,
-        ).to(torch.int8)
+        # xLLM's aclnnQuantize uses input / scale + zero_point.
+        x_int8 = kernels.quantize_per_tensor(
+            x,
+            self.input_scale,
+            self.input_offset,
+            torch.qint8,
+            -1,
+        )
+        bias = (
+            self.quant_bias
+            if not (self.row_parallel and distributed.tp_rank(x.device) != 0)
+            else None
+        )
         return kernels.quant_matmul(
             x_int8, self.weight, False, self.deq_scale, None, None,
-            self.quant_bias if not (self.row_parallel and distributed.tp_rank(x.device) != 0) else None,
+            bias,
             torch.bfloat16,
         )
 
@@ -397,7 +447,10 @@ class W8A8DynamicLinear(nn.Module):
                 "wrong. Expected symmetric int8 (offset == 0)."
             )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
         x_int8, pertoken = kernels.dynamic_quant(x)
         return kernels.quant_matmul(
             x_int8, self.weight, False, self.weight_scale, None,
@@ -508,17 +561,30 @@ class DeepseekV3MLP(nn.Module):
         self.tp = tp
         self.skip_tp_reduce = skip_tp_reduce
         self.gate_up_proj = W8A8DynamicLinear(cfg.hidden_size, 2 * inter_local, device)
-        self.down_proj = W8A8DynamicLinear(inter_local, cfg.hidden_size, device)
+        self.down_proj = W8A8DynamicLinear(
+            inter_local,
+            cfg.hidden_size,
+            device,
+        )
 
     def process_weights_after_loading(self) -> None:
         self.gate_up_proj.process_weights_after_loading()
         self.down_proj.process_weights_after_loading()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        tp_reduce_add: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         gate_up = self.gate_up_proj(x)
         act = kernels.silu_and_mul(gate_up)
+        reduce_result = self.tp > 1 and (
+            not self.skip_tp_reduce or tp_reduce_add is not None
+        )
         out = self.down_proj(act)
-        if self.tp > 1 and not self.skip_tp_reduce:
+        if tp_reduce_add is not None:
+            out = out + tp_reduce_add
+        if reduce_result:
             distributed.all_reduce_(out)
         return out
 
@@ -578,8 +644,12 @@ class DeepseekV3MLAAttention(Attention):
             dtype=dtype,
             device=device,
         )
-        self.o_proj = W8A8StaticLinear(num_heads * v_head, cfg.hidden_size, device,
-                                       row_parallel=True)
+        self.o_proj = W8A8StaticLinear(
+            num_heads * v_head,
+            cfg.hidden_size,
+            device,
+            row_parallel=True,
+        )
         self.register_buffer(
             "W_UK",
             torch.empty(num_heads, qk_nope, kv_lora, dtype=dtype, device=device),
@@ -621,11 +691,14 @@ class DeepseekV3MLAAttention(Attention):
         q_a = self.q_a_proj(hidden)
         q_c = self.q_a_layernorm(q_a)
         backend = get_forward_context().attention_backend
+        half_rope_cos, half_rope_sin = _gather_half_rope_cos_sin(
+            cos_sin_cache, positions
+        )
         topk = None
         if self.indexer is not None:
             ctx = backend.mla_index_context(self)
             topk = self.indexer.select_qli(
-                hidden, q_c, positions, ctx, cos_sin_cache
+                hidden, q_c, ctx, half_rope_cos, half_rope_sin
             )
         q = self.q_b_proj(q_c)
         q = q.view(
@@ -639,7 +712,9 @@ class DeepseekV3MLAAttention(Attention):
         q_latent = torch.bmm(
             q_nope.transpose(0, 1), self.W_UK
         ).transpose(0, 1)
-        cos, sin = _gather_interleave_cos_sin(cos_sin_cache, positions)
+        cos, sin = _expand_interleave_rope_cos_sin(
+            half_rope_cos, half_rope_sin
+        )
         q_pe = _interleave_rope_with(q_rope, cos, sin)
         kv = self.kv_a_proj_with_mqa(hidden)
         k_latent_raw, k_rope_raw = kv.split(
@@ -677,10 +752,15 @@ class DeepseekV3Indexer(nn.Module):
         self.topk = cfg.index_topk
         self.wq_b = nn.Linear(cfg.q_lora_rank, self.n_head * self.head_dim,
                              bias=False, dtype=dtype, device=device)
-        self.wk = nn.Linear(cfg.hidden_size, self.head_dim,
-                            bias=False, dtype=dtype, device=device)
-        self.weights_proj = nn.Linear(cfg.hidden_size, self.n_head,
-                                      bias=False, dtype=dtype, device=device)
+        # Both projections consume the same hidden state.  Keep checkpoint
+        # order as [wk, weights_proj] and execute one GEMM, then split rows.
+        self.wk_weights_proj = nn.Linear(
+            cfg.hidden_size,
+            self.head_dim + self.n_head,
+            bias=False,
+            dtype=dtype,
+            device=device,
+        )
         self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6,
                                    dtype=dtype, device=device)
 
@@ -688,23 +768,24 @@ class DeepseekV3Indexer(nn.Module):
         self,
         hidden: torch.Tensor,
         qr: torch.Tensor,
-        positions: torch.Tensor,
         ctx: MlaIndexContext,
-        cos_sin_cache: torch.Tensor,
+        half_rope_cos: torch.Tensor,
+        half_rope_sin: torch.Tensor,
     ) -> torch.Tensor:
         q = self.wq_b(qr).view(-1, self.n_head, self.head_dim)
         q_pe, q_nope = torch.split(
             q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
         )
-        k = self.wk(hidden)
-        weights = self.weights_proj(hidden)
+        k, weights = self.wk_weights_proj(hidden).split(
+            [self.head_dim, self.n_head], dim=-1
+        )
         k = self.k_norm(k)
         k_pe, k_nope = torch.split(
             k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
         )
-        q_pe = _apply_half_rope(cos_sin_cache, q_pe, positions)
-        k_pe = _apply_half_rope(
-            cos_sin_cache, k_pe.unsqueeze(1), positions
+        q_pe = _apply_half_rope_with_angles(q_pe, half_rope_cos, half_rope_sin)
+        k_pe = _apply_half_rope_with_angles(
+            k_pe.unsqueeze(1), half_rope_cos, half_rope_sin
         ).squeeze(1)
         q = torch.cat([q_pe, q_nope], dim=-1)
         k = torch.cat([k_pe, k_nope], dim=-1)
@@ -760,8 +841,16 @@ class DeepseekV3MoE(nn.Module):
         assert self.moe_inter % tp == 0
         self.inter_local = self.moe_inter // tp
 
+        # The ATB DeepSeek path promotes the router input and gate weights to
+        # FP32 before noaux_tc top-k routing. Keep the Python path identical:
+        # a BF16 router changes expert probabilities enough to diverge during
+        # autoregressive decode even when the selected experts do not change.
         self.gate = nn.Linear(
-            cfg.hidden_size, self.num_experts, bias=False, dtype=dtype, device=device
+            cfg.hidden_size,
+            self.num_experts,
+            bias=False,
+            dtype=torch.float32,
+            device=device,
         )
         self.register_buffer(
             "e_score_correction_bias",
@@ -783,6 +872,14 @@ class DeepseekV3MoE(nn.Module):
             ),
         )
         self.register_buffer(
+            "experts_w13_scale_compute",
+            torch.empty(
+                self.num_experts, 2 * self.inter_local,
+                dtype=torch.bfloat16, device=device,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
             "experts_w13_offset",
             torch.empty(
                 self.num_experts, 2 * self.inter_local, 1,
@@ -802,6 +899,14 @@ class DeepseekV3MoE(nn.Module):
                 self.num_experts, self.hidden, 1,
                 dtype=torch.float32, device=device,
             ),
+        )
+        self.register_buffer(
+            "experts_w2_scale_compute",
+            torch.empty(
+                self.num_experts, self.hidden,
+                dtype=torch.bfloat16, device=device,
+            ),
+            persistent=False,
         )
         self.register_buffer(
             "experts_w2_offset",
@@ -832,38 +937,42 @@ class DeepseekV3MoE(nn.Module):
         self.experts_w13_scale.data = self.experts_w13_scale.data.view(
             self.num_experts, -1
         ).contiguous()
+        # ATB converts both grouped-expert scale tensors to BF16 before the
+        # grouped matmuls. Preserve the FP32 checkpoint value for loading, but
+        # pass the same BF16 value to the NPU operator.
+        self.experts_w13_scale_compute.copy_(self.experts_w13_scale)
         self.experts_w13_offset.data = self.experts_w13_offset.data.view(
             self.num_experts, -1
         ).contiguous()
         self.experts_w2_scale.data = self.experts_w2_scale.data.view(
             self.num_experts, -1
         ).contiguous()
+        self.experts_w2_scale_compute.copy_(self.experts_w2_scale)
         self.experts_w2_offset.data = self.experts_w2_offset.data.view(
             self.num_experts, -1
         ).contiguous()
         self.shared_experts.process_weights_after_loading()
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        logits = self.gate(hidden)
+        logits = self.gate(hidden.to(torch.float32))
         routed = kernels.grouped_moe(
             hidden,
             logits,
             self.experts_w13,
             self.experts_w2,
-            self.experts_w13_scale,
-            self.experts_w2_scale,
+            self.experts_w13_scale_compute,
+            self.experts_w2_scale_compute,
             self.e_score_correction_bias,
             self.topk,
             self.topk_group,
             self.n_group,
             self.cfg.norm_topk_prob,
+            # ATB applies this in its fused top-k before BF16 expert compute.
+            self.routed_scaling,
         )
-        routed = routed * self.routed_scaling
-        shared_out = self.shared_experts(hidden)
-        final = routed + shared_out
         if self.cfg.tp_size > 1:
-            distributed.all_reduce_(final)
-        return final
+            return self.shared_experts(hidden, tp_reduce_add=routed)
+        return routed + self.shared_experts(hidden)
 
 
 class DeepseekV3DecoderLayer(nn.Module):
@@ -1033,9 +1142,16 @@ class DeepseekV3ForCausalLM(PyModelBase):
                 idx = attn + "indexer."
                 loader.copy_in(idx + "wq_b.weight",
                                loader.load_tensor(idx + "wq_b.weight"))
-                loader.copy_in(idx + "wk.weight", loader.load_tensor(idx + "wk.weight"))
-                loader.copy_in(idx + "weights_proj.weight",
-                               loader.load_tensor(idx + "weights_proj.weight"))
+                loader.copy_in(
+                    idx + "wk_weights_proj.weight",
+                    torch.cat(
+                        [
+                            loader.load_tensor(idx + "wk.weight"),
+                            loader.load_tensor(idx + "weights_proj.weight"),
+                        ],
+                        dim=0,
+                    ).contiguous(),
+                )
                 loader.copy_in(idx + "k_norm.weight",
                                loader.load_tensor(idx + "k_norm.weight"))
                 loader.copy_in(idx + "k_norm.bias",
