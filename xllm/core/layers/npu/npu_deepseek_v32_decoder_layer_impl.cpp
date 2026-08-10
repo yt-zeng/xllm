@@ -18,8 +18,10 @@ limitations under the License.
 #include <gflags/gflags.h>
 
 #include <algorithm>
+#include <array>
 #include <boost/algorithm/string.hpp>
 #include <cctype>
+#include <cstdlib>
 #include <iostream>
 #include <numeric>
 #include <optional>
@@ -32,7 +34,10 @@ limitations under the License.
 #include "core/framework/config/load_config.h"
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/scheduler_config.h"
+#include "core/kernels/npu/npu_ops_api.h"
+#include "core/kernels/npu/xllm_ops/xllm_ops_api.h"
 #include "core/layers/common/dsa_topk_share_plan.h"
+#include "core/util/tensor_helper.h"
 #include "framework/parallel_state/npu_cp_plan.h"
 #include "framework/quant_args.h"
 #include "layers/common/rotary_embedding_util.h"
@@ -42,7 +47,25 @@ namespace xllm {
 namespace layer {
 
 namespace {
+constexpr size_t kLayerDebugOutputCount = 4;
+constexpr size_t kMlaDebugOutputCount = 4;
+constexpr size_t kMaxDebugOutputCount =
+    kLayerDebugOutputCount + kMlaDebugOutputCount;
 constexpr int32_t kQProjBLinearIndex = 1;
+const std::array<const char*, kMaxDebugOutputCount> kDebugOutputNames = {
+    "attention_out",
+    "attention_add_out",
+    "post_attention_norm_out",
+    "mlp_out",
+    "mla_input_norm_quant",
+    "mla_q_a_out",
+    "mla_q_a_norm_quant",
+    "mla_q_b_out"};
+
+bool is_debug_output_enabled() {
+  const char* dump_dir = std::getenv("XLLM_CPP_LAYER_DETAIL_DUMP_DIR");
+  return dump_dir != nullptr && dump_dir[0] != '\0';
+}
 constexpr int32_t kIndexerWqBLinearIndex = 6;
 constexpr int32_t kIndexerProjLinearIndex = 8;
 constexpr int32_t kTranspose = 1;
@@ -348,6 +371,8 @@ NpuDeepseekV32DecoderLayerImpl::NpuDeepseekV32DecoderLayerImpl(
       get_dsa_topk_share_decision(model_args, layer_id_);
   skip_topk_ = topk_decision.reuse_topk;
   output_topk_ = topk_decision.output_topk;
+  debug_output_enabled_ = is_debug_output_enabled();
+  mla_debug_output_enabled_ = debug_output_enabled_ && layer_id_ == 0;
 
   rank_ = parallel_args.rank();
   first_k_dense_replace_ = model_args.first_k_dense_replace();
@@ -466,6 +491,8 @@ void NpuDeepseekV32DecoderLayerImpl::param_from_args(
   initialize_mlp_parameters(param, args, parallel_args);
   initialize_parallel_parameters(param, parallel_args);
   initialize_quantization_parameters(param);
+  param.enableDebugOutput = debug_output_enabled_;
+  param.enableMlaDebugOutput = mla_debug_output_enabled_ && is_prefill;
 }
 
 void NpuDeepseekV32DecoderLayerImpl::initialize_basic_parameters(
@@ -765,6 +792,16 @@ void NpuDeepseekV32DecoderLayerImpl::initialize_quantization_parameters(
 void NpuDeepseekV32DecoderLayerImpl::merge_loaded_weights() {
   loader_->merge_loaded_weights();
   auto& at_weight_tensors = loader_->get_at_weight_tensors();
+  if (mla_debug_output_enabled_) {
+    debug_input_norm_weight_ =
+        at_weight_tensors.at(IN_INPUT_NORM_WEIGHT);
+    debug_q_a_norm_weight_ =
+        at_weight_tensors.at(IN_Q_PROJ_A_LAYERNORM_WEIGHT);
+    debug_q_a_scale_ = at_weight_tensors.at(IN_Q_PROJ_A_SCALE);
+    debug_q_a_offset_ = at_weight_tensors.at(IN_Q_PROJ_A_OFFSET);
+    debug_q_b_scale_ = at_weight_tensors.at(IN_Q_PROJ_B_SCALE);
+    debug_q_b_offset_ = at_weight_tensors.at(IN_Q_PROJ_B_OFFSET);
+  }
   Device::empty_cache(device_.index());
   for (int i = 0; i < WEIGHT_COUNT_PER_LAYER; ++i) {
     atb_weight_tensors_[i] =
@@ -976,9 +1013,6 @@ int64_t NpuDeepseekV32DecoderLayerImpl::init_layer() {
 int64_t NpuDeepseekV32DecoderLayerImpl::init_node(
     atb_speed::Model::Node& node,
     atb_speed::deepseekV2::DecoderLayerParam& param) {
-  bool eplb_enabled = ::xllm::EPLBConfig::get_instance().enable_eplb() &&
-                      layer_id_ >= decode_param_.firstKDenseReplace &&
-                      !decode_param_.isPrefill;
   atb::Operation* operation = nullptr;
   atb_speed::deepseekV2::DecoderLayer(param, &operation);
   node.operation.reset(operation);
@@ -992,16 +1026,8 @@ int64_t NpuDeepseekV32DecoderLayerImpl::init_node(
   }
   node.inTensors.resize(node.operation->GetInputNum());
 
-  size_t out_tensor_num = 1;
-  if (eplb_enabled) {
-    ++out_tensor_num;
-  }
-  if (param.outputTopk) {
-    ++out_tensor_num;
-  }
+  const size_t out_tensor_num = node.operation->GetOutputNum();
   node.outTensors.resize(out_tensor_num);
-
-  size_t inTensorId = 1;
 
   for (size_t weightTensorId = 0; weightTensorId < WEIGHT_COUNT_PER_LAYER;
        ++weightTensorId) {
@@ -1072,6 +1098,7 @@ torch::Tensor NpuDeepseekV32DecoderLayerImpl::forward_with_topk(
     st = execute_node(decode_node_, node_id, event, event_flag);
     LOG_IF(FATAL, st != 0) << model_name_
                            << "execute prefill layer fail, error code: " << st;
+    dump_debug_outputs(/*is_prefill=*/false);
   } else {
     build_node_variant_pack(prefill_node_,
                             x,
@@ -1088,6 +1115,7 @@ torch::Tensor NpuDeepseekV32DecoderLayerImpl::forward_with_topk(
     st = execute_node(prefill_node_, node_id, event, event_flag);
     LOG_IF(FATAL, st != 0) << model_name_
                            << "execute prefill layer fail, error code: " << st;
+    dump_debug_outputs(/*is_prefill=*/true);
   }
   return tensor_placeholder_;
 }
@@ -1305,7 +1333,11 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 30) =
         atb_speed::Utils::AtTensor2Tensor(expert_routing_map_);
     if (!is_prefill) {
-      node.variantPack.outTensors.at(1) = atb_speed::Utils::AtTensor2Tensor(
+      const size_t expert_cumsum_output_index =
+          1 + (debug_output_enabled_ ? kLayerDebugOutputCount : 0) +
+          (mla_debug_output_enabled_ && is_prefill ? kMlaDebugOutputCount : 0);
+      node.variantPack.outTensors
+          .at(expert_cumsum_output_index) = atb_speed::Utils::AtTensor2Tensor(
           input_params.expert
               .expert_load_data[layer_id_ - decode_param_.firstKDenseReplace]);
     }
@@ -1381,11 +1413,100 @@ void NpuDeepseekV32DecoderLayerImpl::build_node_variant_pack(
   }
 
   node.variantPack.outTensors.at(0) = internal_tensor_;
+  if (mla_debug_output_enabled_ && is_prefill) {
+    debug_mla_input_ = x.clone();
+  }
+  if (debug_output_enabled_) {
+    const size_t debug_output_count =
+        kLayerDebugOutputCount +
+        (mla_debug_output_enabled_ && is_prefill ? kMlaDebugOutputCount : 0);
+    atb::SVector<atb::TensorDesc> input_descs;
+    input_descs.resize(node.variantPack.inTensors.size());
+    for (size_t index = 0; index < input_descs.size(); ++index) {
+      input_descs.at(index) = node.variantPack.inTensors.at(index).desc;
+    }
+    atb::SVector<atb::TensorDesc> output_descs;
+    output_descs.resize(node.variantPack.outTensors.size());
+    const atb::Status infer_status =
+        node.operation->InferShape(input_descs, output_descs);
+    CHECK_EQ(infer_status, atb::NO_ERROR)
+        << model_name_ << " infer debug output shape failed";
+
+    debug_output_tensors_.clear();
+    debug_output_tensors_.reserve(debug_output_count);
+    for (size_t index = 0; index < debug_output_count; ++index) {
+      debug_output_tensors_.emplace_back(
+          atb_speed::Utils::CreateAtTensorFromTensorDesc(
+              output_descs.at(index + 1)));
+      node.variantPack.outTensors.at(index + 1) =
+          atb_speed::Utils::AtTensor2Tensor(debug_output_tensors_.back());
+    }
+  }
   if (output_topk) {
     CHECK(output_topk_indices != nullptr && output_topk_indices->defined())
         << "DSA top-k sharing output tensor is not initialized.";
     node.variantPack.outTensors.at(node.variantPack.outTensors.size() - 1) =
         atb_speed::Utils::AtTensor2Tensor(*output_topk_indices);
+  }
+}
+
+void NpuDeepseekV32DecoderLayerImpl::dump_debug_outputs(bool is_prefill) const {
+  if (!debug_output_enabled_) {
+    return;
+  }
+  const char* dump_dir = std::getenv("XLLM_CPP_LAYER_DETAIL_DUMP_DIR");
+  CHECK(dump_dir != nullptr && dump_dir[0] != '\0');
+  const size_t debug_output_count =
+      kLayerDebugOutputCount +
+      (mla_debug_output_enabled_ && is_prefill ? kMlaDebugOutputCount : 0);
+  CHECK_EQ(debug_output_tensors_.size(), debug_output_count);
+  for (size_t index = 0; index < debug_output_count; ++index) {
+    const std::string path = std::string(dump_dir) + "/layer_" +
+                             std::to_string(layer_id_) + "_" +
+                             kDebugOutputNames[index] + ".pt";
+    save_tensor_as_pickle(debug_output_tensors_[index].detach().cpu(), path);
+  }
+  if (mla_debug_output_enabled_ && is_prefill) {
+    CHECK(debug_mla_input_.defined());
+    const torch::Tensor input_norm_bf16 = xllm::kernel::npu::rms_norm(
+        debug_mla_input_,
+        debug_input_norm_weight_,
+        prefill_param_.normEps,
+        "rmsnorm");
+    const torch::Tensor q_a_norm_bf16 = xllm::kernel::npu::rms_norm(
+        debug_output_tensors_.at(kLayerDebugOutputCount + 1),
+        debug_q_a_norm_weight_,
+        prefill_param_.normEps,
+        "rmsnorm");
+    const torch::Tensor input_norm_quant_ref =
+        xllm::kernel::npu::quantize_per_tensor(
+            input_norm_bf16,
+            debug_q_a_scale_,
+            debug_q_a_offset_.to(input_norm_bf16.scalar_type()),
+            torch::kQInt8,
+            -1);
+    const torch::Tensor q_a_norm_quant_ref =
+        xllm::kernel::npu::quantize_per_tensor(
+            q_a_norm_bf16,
+            debug_q_b_scale_,
+            debug_q_b_offset_.to(q_a_norm_bf16.scalar_type()),
+            torch::kQInt8,
+            -1);
+    const std::array<std::pair<torch::Tensor, const char*>, 8> extra_dumps = {
+        std::make_pair(input_norm_bf16, "mla_input_norm_bf16"),
+        std::make_pair(debug_q_a_scale_, "mla_input_norm_quant_scale"),
+        std::make_pair(debug_q_a_offset_, "mla_input_norm_quant_offset"),
+        std::make_pair(input_norm_quant_ref, "mla_input_norm_quant_ref"),
+        std::make_pair(q_a_norm_bf16, "mla_q_a_norm_bf16"),
+        std::make_pair(debug_q_b_scale_, "mla_q_a_norm_quant_scale"),
+        std::make_pair(debug_q_b_offset_, "mla_q_a_norm_quant_offset"),
+        std::make_pair(q_a_norm_quant_ref, "mla_q_a_norm_quant_ref")};
+    for (const auto& [tensor, tensor_name] : extra_dumps) {
+      const std::string path = std::string(dump_dir) + "/layer_" +
+                               std::to_string(layer_id_) + "_" + tensor_name +
+                               ".pt";
+      save_tensor_as_pickle(tensor.detach().cpu(), path);
+    }
   }
 }
 

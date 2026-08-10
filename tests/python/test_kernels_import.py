@@ -59,6 +59,21 @@ _NPU_SCHEMAS = (
     "ScalarType dtype, int axis) -> Tensor",
     "dynamic_quant(Tensor input, Tensor? smooth_scales, Tensor? group_index, "
     "ScalarType? dst_type) -> (Tensor, Tensor?)",
+    "inplace_partial_rotary_mul(Tensor(a!) input, Tensor cosine, Tensor sine, "
+    "str rotary_mode, int[] partial_slice) -> ()",
+    "quant_lightning_indexer(Tensor query, Tensor key, Tensor weights, Tensor "
+    "query_dequant_scale, Tensor key_dequant_scale, int query_quant_mode, int "
+    "key_quant_mode, Tensor? actual_seq_lengths_query, Tensor? "
+    "actual_seq_lengths_key, Tensor? block_table, Tensor? metadata, str "
+    "layout_query, str layout_key, int sparse_count, int sparse_mode, int "
+    "pre_tokens, int next_tokens, int cmp_ratio, bool return_value) -> "
+    "(Tensor, Tensor)",
+    "quant_lightning_indexer_metadata(int num_heads_q, int num_heads_k, int "
+    "head_dim, int query_quant_mode, int key_quant_mode, Tensor? "
+    "actual_seq_lengths_query, Tensor? actual_seq_lengths_key, int "
+    "batch_size, int max_seqlen_q, int max_seqlen_k, str layout_query, str "
+    "layout_key, int sparse_count, int sparse_mode, int pre_tokens, int "
+    "next_tokens, int cmp_ratio, str device) -> Tensor",
     "lightning_indexer(Tensor query, Tensor key, Tensor weights, Tensor? "
     "query_seq_lengths, Tensor? key_seq_lengths, Tensor? block_table, str "
     "layout_query, str layout_key, int selected_count, int sparse_mode, int "
@@ -205,7 +220,11 @@ def test_npu_fake_tensor_and_mutation_contracts() -> None:
     _run_isolated_python(
         """
         import xllm.python.kernels_npu._custom_op  # noqa: F401
-        from xllm.python.kernels_npu import quantization, sparse_attention
+        from xllm.python.kernels_npu import (
+            quantization,
+            rotary_embedding,
+            sparse_attention,
+        )
 
         mode = torch._subclasses.fake_tensor.FakeTensorMode()
         with mode:
@@ -228,6 +247,28 @@ def test_npu_fake_tensor_and_mutation_contracts() -> None:
                 "TND", "TND", 3, 0, 0, 0, False,
             )
             assert indices.shape == (8, 2, 3)
+            seq_lengths = torch.arange(1, 9, dtype=torch.int32)
+            qli_metadata = sparse_attention.quant_lightning_indexer_metadata(
+                4, 2, 16, seq_lengths, seq_lengths, 1, 8, 3, 1,
+            )
+            assert qli_metadata.shape == (1024,)
+            quant_indices = sparse_attention.quant_lightning_indexer(
+                query.to(torch.int8),
+                torch.empty(2, 4, 2, 16, dtype=torch.int8),
+                torch.empty(8, 4, dtype=torch.float16),
+                torch.empty(8, 4, dtype=torch.float16),
+                torch.empty(2, 4, 2, dtype=torch.float16),
+                qli_metadata, None, None, None, 3, 1,
+            )
+            assert quant_indices.shape == (8, 2, 3)
+            rotary_value = torch.empty(8, 4, 16)
+            assert rotary_embedding.inplace_partial_rotary_mul(
+                rotary_value,
+                torch.empty(8, 1, 1, 8),
+                torch.empty(8, 1, 1, 8),
+                0,
+                8,
+            ) is None
             assert sparse_attention.sparse_flash_attention(
                 query, key, torch.empty_like(key), indices, None, None, None,
                 None, None, 1.0, 128, "TND", "TND", 0,

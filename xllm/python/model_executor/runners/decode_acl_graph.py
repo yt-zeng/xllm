@@ -477,10 +477,13 @@ class DecodeAclGraphRunner(BaseRunner):
         if first_capture:
             self._capture(entry)
 
+        # Besides ordering input updates, this wait protects the output view
+        # returned by the previous replay.  The graph cannot overwrite its
+        # static output until consumers queued on the current stream finish.
         self._stream.wait_stream(torch.npu.current_stream())
         with torch.npu.stream(self._stream):
             entry.graph.replay()
-            output = entry.static_output[:batch_size].clone()
+            output = entry.static_output[:batch_size]
 
         # A captured FIA task waits on its update event before execution.  This
         # lets replay run concurrently with the host-side updates for later

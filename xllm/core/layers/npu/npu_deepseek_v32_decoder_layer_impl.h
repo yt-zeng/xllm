@@ -40,7 +40,7 @@ class NpuDeepseekV32DecoderLayerImpl : public BaseLayer {
   explicit NpuDeepseekV32DecoderLayerImpl(const ModelContext& context,
                                           const int32_t layer_id);
 
-  ~NpuDeepseekV32DecoderLayerImpl() {};
+  ~NpuDeepseekV32DecoderLayerImpl(){};
 
   void merge_loaded_weights() override;
 
@@ -161,6 +161,8 @@ class NpuDeepseekV32DecoderLayerImpl : public BaseLayer {
                                bool skip_topk,
                                bool output_topk);
 
+  void dump_debug_outputs(bool is_prefill) const;
+
   torch::Tensor block_tables_placeholder_;
   std::string model_name_;
 
@@ -174,6 +176,8 @@ class NpuDeepseekV32DecoderLayerImpl : public BaseLayer {
   bool skip_topk_ = false;
   bool output_topk_ = false;
   bool has_mtp_topk_fallback_ = false;
+  bool debug_output_enabled_ = false;
+  bool mla_debug_output_enabled_ = false;
 
   int32_t rank_;
   int32_t first_k_dense_replace_;
@@ -222,6 +226,14 @@ class NpuDeepseekV32DecoderLayerImpl : public BaseLayer {
   torch::Tensor one_hot_;
   torch::Tensor zero_hot_;
   torch::Tensor final_hidden_states_;
+  torch::Tensor debug_mla_input_;
+  torch::Tensor debug_input_norm_weight_;
+  torch::Tensor debug_q_a_norm_weight_;
+  torch::Tensor debug_q_a_scale_;
+  torch::Tensor debug_q_a_offset_;
+  torch::Tensor debug_q_b_scale_;
+  torch::Tensor debug_q_b_offset_;
+  std::vector<torch::Tensor> debug_output_tensors_;
   torch::Tensor at_start_expert_id_;
   torch::Tensor at_in_device_expert_count_;
 

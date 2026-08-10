@@ -106,20 +106,22 @@ def grouped_moe(
     )
     num_tokens = hidden_states.shape[0]
     num_experts = w13.shape[0]
-    sorted_hidden_i8, expanded_row_idx, expert_tokens, pertoken_scale = (
+    sorted_hidden_i8, expanded_row_idx, group_list, pertoken_scale = (
         torch_npu.npu_moe_init_routing_v2(
             hidden_states,
             topk_ids.to(torch.int32),
             scale=None,
             active_num=num_tokens * topk,
             expert_num=num_experts,
-            expert_tokens_num_type=1,
+            # The grouped matmuls consume cumulative expert-token offsets.
+            # Request that layout directly instead of launching a separate
+            # Cumsum kernel on the critical routed-expert stream.
+            expert_tokens_num_type=0,
             expert_tokens_num_flag=True,
             active_expert_range=[0, num_experts],
             quant_mode=1,
         )
     )
-    group_list = torch.cumsum(expert_tokens.to(torch.int64), 0)
     act_i8, act_pt, _ = torch.ops.npu.npu_grouped_matmul_swiglu_quant(
         x=sorted_hidden_i8,
         weight=w13,

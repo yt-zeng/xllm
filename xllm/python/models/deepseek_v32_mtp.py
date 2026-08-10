@@ -105,10 +105,19 @@ class DeepseekV32MtpModel(nn.Module):
             torch.cat((self.enorm(token_hidden), self.hnorm(rotated_embedding)), dim=-1)
         )
         positions = positions.to(torch.int64).contiguous()
-        cos_sin_cache = self.rotary.cos_sin_cache
+        half_rope_cos, half_rope_sin, rope_cos, rope_sin = self.rotary(
+            positions
+        )
         residual: Optional[torch.Tensor] = None
         for layer in self.layers:
-            h, residual = layer(h, residual, positions, cos_sin_cache)
+            h, residual = layer(
+                h,
+                residual,
+                half_rope_cos,
+                half_rope_sin,
+                rope_cos,
+                rope_sin,
+            )
         h, _ = self.norm(h, residual)
         return h
 

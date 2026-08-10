@@ -73,11 +73,14 @@ from .quantization import (
 )
 from .rotary_embedding import (
     fused_qk_norm_rope,
+    inplace_partial_rotary_mul,
     interleaved_rotary_embedding,
 )
 from .sparse_attention import (
     lightning_indexer,
     lightning_indexer_out,
+    quant_lightning_indexer,
+    quant_lightning_indexer_metadata,
     scatter_nd_update,
     sparse_flash_attention,
     sparse_flash_attention_out,
@@ -94,6 +97,7 @@ __all__ = [
     "batch_matmul_transpose",
     "fused_qk_norm_rope",
     "interleaved_rotary_embedding",
+    "inplace_partial_rotary_mul",
     "moe_fused_topk",
     "cutlass_fused_moe",
     "fused_moe",
@@ -107,6 +111,8 @@ __all__ = [
     "dynamic_quant",
     "lightning_indexer",
     "lightning_indexer_out",
+    "quant_lightning_indexer",
+    "quant_lightning_indexer_metadata",
     "scatter_nd_update",
     "sparse_flash_attention",
     "sparse_flash_attention_out",

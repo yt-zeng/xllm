@@ -94,6 +94,11 @@ class NpuPagedAttentionBackend(AttentionBackend):
         self._actual_seq_kv: list[int] | torch.Tensor = []
         self._mla_actual_seq_q: torch.Tensor | None = None
         self._mla_actual_seq_kv: torch.Tensor | None = None
+        self._mla_quant_indexer_metadata: dict[
+            tuple[int, int, int, int], torch.Tensor
+        ] = {}
+        self._mla_max_seqlen_q = 0
+        self._mla_max_seqlen_k = 0
         self._causal_mask = (
             torch.triu(torch.ones(2048, 2048, dtype=torch.float32), 1)
             .to(torch.int8)
@@ -252,6 +257,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
 
         # Pre-cache MLA (sparse SFA) seq-lens once per step; shared by
         # execute_mla / mla_index_context instead of re-derived per layer.
+        self._mla_quant_indexer_metadata.clear()
         if self._is_mla and kv_seq_lens is not None:
             mla_device = kv_seq_lens.device
             actual_seq_kv = kv_seq_lens.to(torch.int32).to(mla_device)
@@ -287,9 +293,28 @@ class NpuPagedAttentionBackend(AttentionBackend):
             else:
                 self._mla_actual_seq_q = actual_seq_q
                 self._mla_actual_seq_kv = actual_seq_kv
+            if metadata.is_prefill or metadata.is_chunked_prefill:
+                q_seq_lens = getattr(metadata, "q_seq_lens", None)
+                if q_seq_lens is not None and q_seq_lens.numel() > 0:
+                    self._mla_max_seqlen_q = int(q_seq_lens.max().item())
+                else:
+                    seq_starts = torch.cat(
+                        [actual_seq_q.new_zeros(1), actual_seq_q[:-1]]
+                    )
+                    self._mla_max_seqlen_q = int(
+                        (actual_seq_q - seq_starts).max().item()
+                    )
+            else:
+                self._mla_max_seqlen_q = 1
+            if kv_seq_lens_host_values:
+                self._mla_max_seqlen_k = max(kv_seq_lens_host_values)
+            else:
+                self._mla_max_seqlen_k = int(actual_seq_kv.max().item())
         else:
             self._mla_actual_seq_q = None
             self._mla_actual_seq_kv = None
+            self._mla_max_seqlen_q = 0
+            self._mla_max_seqlen_k = 0
 
     def execute(
         self,
@@ -370,34 +395,84 @@ class NpuPagedAttentionBackend(AttentionBackend):
         assert self._block_table_i32 is not None
         assert self._mla_actual_seq_q is not None
         assert self._mla_actual_seq_kv is not None
-        index_cache = self._kv_caches[layer.layer_id].index
+        layer_cache = self._kv_caches[layer.layer_id]
+        index_cache = layer_cache.index
         if index_cache is None:
             raise RuntimeError(
                 f"MLA index cache is missing for layer {layer.layer_id}"
             )
+        index_cache_scale = layer_cache.index_scale
         return MlaIndexContext(
             index_cache=index_cache,
             slot_mapping=metadata.slot_mapping,
             block_table=self._block_table_i32,
             actual_seq_q=self._mla_actual_seq_q,
             actual_seq_kv=self._mla_actual_seq_kv,
-            update_index_cache=lambda values: self._update_mla_index_cache(
-                index_cache, metadata.slot_mapping, values
+            index_cache_scale=index_cache_scale,
+            get_quant_indexer_metadata=lambda num_heads_q, head_dim,
+            sparse_count, cmp_ratio: self._get_quant_indexer_metadata(
+                num_heads_q,
+                index_cache.size(2),
+                head_dim,
+                sparse_count,
+                cmp_ratio,
+            ),
+            update_index_cache=lambda values, scales: self._update_mla_index_cache(
+                index_cache,
+                index_cache_scale,
+                metadata.slot_mapping,
+                values,
+                scales,
             ),
         )
+
+    def _get_quant_indexer_metadata(
+        self,
+        num_heads_q: int,
+        num_heads_k: int,
+        head_dim: int,
+        sparse_count: int,
+        cmp_ratio: int,
+    ) -> torch.Tensor:
+        assert self._mla_actual_seq_q is not None
+        assert self._mla_actual_seq_kv is not None
+        cache_key = (num_heads_q, head_dim, sparse_count, cmp_ratio)
+        metadata = self._mla_quant_indexer_metadata.get(cache_key)
+        if metadata is None:
+            metadata = kernels.quant_lightning_indexer_metadata(
+                num_heads_q,
+                num_heads_k,
+                head_dim,
+                self._mla_actual_seq_q,
+                self._mla_actual_seq_kv,
+                self._mla_max_seqlen_q,
+                self._mla_max_seqlen_k,
+                sparse_count,
+                cmp_ratio,
+            )
+            self._mla_quant_indexer_metadata[cache_key] = metadata
+        return metadata
 
     @staticmethod
     def _update_mla_index_cache(
         index_cache: torch.Tensor,
+        index_cache_scale: torch.Tensor | None,
         slot_mapping: torch.Tensor,
         values: torch.Tensor,
+        scales: torch.Tensor | None,
     ) -> None:
         cache_view = index_cache.view(-1, index_cache.size(-1))
+        scatter_indices = slot_mapping.reshape(-1, 1).clamp_min(0)
         kernels.scatter_nd_update(
             cache_view,
-            slot_mapping.reshape(-1, 1).clamp_min(0),
+            scatter_indices,
             values,
         )
+        if index_cache_scale is not None and scales is not None:
+            scale_view = index_cache_scale.view(
+                -1, index_cache_scale.size(-1)
+            )
+            kernels.scatter_nd_update(scale_view, scatter_indices, scales)
 
     def _mla_sparse(
         self,

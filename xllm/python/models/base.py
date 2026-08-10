@@ -24,6 +24,7 @@ PyCausalLM no longer calls model.forward() directly.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -31,6 +32,23 @@ import torch.nn as nn
 
 if TYPE_CHECKING:
     from xllm_weight_loader import StateDict
+
+
+def _dump_tensor_from_env(tensor: torch.Tensor, env_name: str) -> None:
+    """Dump a tensor when the requested debug path is configured."""
+    path = os.environ.get(env_name)
+    if path:
+        torch.save(tensor.detach().cpu(), path)
+
+
+def _dump_tensor_to_env_dir(
+    tensor: torch.Tensor, env_name: str, file_name: str
+) -> None:
+    """Dump a named tensor under an environment-controlled directory."""
+    directory = os.environ.get(env_name)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+        torch.save(tensor.detach().cpu(), os.path.join(directory, file_name))
 
 
 class PyModelBase(nn.Module):
@@ -60,7 +78,10 @@ class PyModelBase(nn.Module):
     ) -> torch.Tensor:
         if selected_idxes is not None and selected_idxes.numel() > 0:
             hidden = hidden.index_select(0, selected_idxes)
-        return self.lm_head(hidden)
+        _dump_tensor_from_env(hidden, "XLLM_PYTHON_HIDDEN_DUMP_PATH")
+        logits = self.lm_head(hidden)
+        _dump_tensor_from_env(logits, "XLLM_PYTHON_LOGITS_DUMP_PATH")
+        return logits
 
     # -- weight loading -------------------------------------------------------
     def load_weights(

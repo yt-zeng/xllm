@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -40,7 +41,35 @@ from xllm.python.model_executor.forward_context import (
     get_execution_buffer,
     get_forward_context,
 )
-from xllm.python.models.base import PyModelBase
+from xllm.python.models.base import PyModelBase, _dump_tensor_to_env_dir
+
+
+_SHARED_EXPERT_STREAMS: dict[
+    tuple[str, int | None], torch.npu.Stream
+] = {}
+_FUSED_QKV_A_PROJ_ENABLED = os.environ.get(
+    "XLLM_FUSED_QKV_A_PROJ",
+    "1",
+).strip().lower() not in ("0", "false", "off")
+
+
+def _shared_expert_stream(device: torch.device) -> torch.npu.Stream:
+    """Return the process-wide shared-expert stream for one NPU device."""
+    key = (device.type, device.index)
+    stream = _SHARED_EXPERT_STREAMS.get(key)
+    if stream is None:
+        stream = torch.npu.Stream(device=device)
+        _SHARED_EXPERT_STREAMS[key] = stream
+    return stream
+
+
+def _moe_expert_overlap_enabled() -> bool:
+    """Return whether routed and shared experts may overlap on NPU streams."""
+    return os.environ.get("XLLM_ENABLE_MOE_EXPERT_OVERLAP", "1").lower() not in (
+        "0",
+        "false",
+        "off",
+    )
 
 
 def _tp_rank_from_device(device: object) -> int:
@@ -55,7 +84,7 @@ def _tp_rank_from_device(device: object) -> int:
 
 
 def _prepare_quant_weight(weight: torch.Tensor) -> torch.Tensor:
-    """Prepare an INT8 weight while keeping lightweight test stubs usable."""
+    """Prepare an INT8 weight using the selected NPU storage layout."""
     prepare = getattr(kernels, "prepare_quant_weight", None)
     if prepare is not None:
         return prepare(weight)
@@ -69,7 +98,27 @@ def _batch_matmul_transpose(
     matmul = getattr(kernels, "batch_matmul_transpose", None)
     if matmul is not None:
         return matmul(x, weight)
-    return torch.bmm(x, weight)
+    return torch.bmm(x, weight).transpose(0, 1)
+
+
+def _create_hadamard_matrix(
+    dim: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Create the unnormalized Sylvester Hadamard matrix for INT8 rotation."""
+    if dim <= 0 or dim & (dim - 1):
+        raise ValueError("Hadamard dimension must be a positive power of two")
+    matrix = torch.ones((1, 1), dtype=dtype, device=device)
+    while matrix.size(0) < dim:
+        matrix = torch.cat(
+            [
+                torch.cat([matrix, matrix], dim=1),
+                torch.cat([matrix, -matrix], dim=1),
+            ],
+            dim=0,
+        )
+    return matrix.contiguous()
 
 
 def _yarn_get_mscale(scale: float, mscale: float) -> float:
@@ -211,6 +260,16 @@ class DeepseekYarnRotaryEmbedding(RotaryEmbedding):
         self.register_buffer(
             "cos_sin_cache", cache.contiguous(), persistent=False
         )
+
+    def forward(
+        self, positions: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Gather and format the RoPE angles shared by all decoder layers."""
+        half_cos, half_sin = _gather_half_rope_cos_sin(
+            self.cos_sin_cache, positions
+        )
+        cos, sin = _expand_interleave_rope_cos_sin(half_cos, half_sin)
+        return half_cos, half_sin, cos, sin
 
     @staticmethod
     def _yarn_inv_freq(
@@ -382,8 +441,8 @@ class W8A8StaticLinear(nn.Module):
             "quant_bias", torch.empty(out_features, dtype=torch.int32, device=device)
         )
         self.register_buffer(
-            # BaseLoader converts static activation quantization parameters to
-            # BF16; aclnnQuantize requires a BF16 scale for BF16 activations.
+            # BaseLoader keeps the static activation scale in BF16;
+            # aclnnQuantize requires it to match BF16 activations.
             "input_scale", torch.empty(1, dtype=torch.bfloat16, device=device)
         )
         self.register_buffer(
@@ -391,10 +450,7 @@ class W8A8StaticLinear(nn.Module):
         )
 
     def process_weights_after_loading(self) -> None:
-        # Keep the Python path's original logical layout.  QuantMatmulV4's
-        # transpose2=False path must receive the plain transposed tensor;
-        # backend-specific format packing is not part of this model path.
-        self.weight.data = self.weight.data.transpose(0, 1).contiguous()
+        self.weight.data = _prepare_quant_weight(self.weight.data)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # xLLM's aclnnQuantize uses input / scale + zero_point.
@@ -405,9 +461,16 @@ class W8A8StaticLinear(nn.Module):
             torch.qint8,
             -1,
         )
+        return self.forward_quantized(x_int8)
+
+    def forward_quantized(self, x_int8: torch.Tensor) -> torch.Tensor:
+        """Run the linear projection on an already quantized activation."""
         bias = (
             self.quant_bias
-            if not (self.row_parallel and distributed.tp_rank(x.device) != 0)
+            if not (
+                self.row_parallel
+                and distributed.tp_rank(x_int8.device) != 0
+            )
             else None
         )
         return kernels.quant_matmul(
@@ -436,16 +499,14 @@ class W8A8DynamicLinear(nn.Module):
         )
 
     def process_weights_after_loading(self) -> None:
-        self.weight.data = self.weight.data.transpose(0, 1).contiguous()
+        if not bool(torch.all(self.weight_offset == 0)):
+            raise ValueError(
+                "W8A8DynamicLinear requires symmetric INT8 weights with zero "
+                "weight_offset"
+            )
+        self.weight.data = _prepare_quant_weight(self.weight.data)
         self.weight_scale.data = self.weight_scale.data.flatten().contiguous()
         self.weight_offset.data = self.weight_offset.data.flatten().contiguous()
-        if not bool(torch.all(self.weight_offset == 0)):
-            import logging
-            logging.getLogger(__name__).warning(
-                "W8A8DynamicLinear loaded with non-zero weight_offset; the "
-                "int8 matmul path drops the antiquant offset -- output may be "
-                "wrong. Expected symmetric int8 (offset == 0)."
-            )
 
     def forward(
         self,
@@ -453,8 +514,14 @@ class W8A8DynamicLinear(nn.Module):
     ) -> torch.Tensor:
         x_int8, pertoken = kernels.dynamic_quant(x)
         return kernels.quant_matmul(
-            x_int8, self.weight, False, self.weight_scale, None,
-            pertoken, None, torch.bfloat16,
+            x_int8,
+            self.weight,
+            False,
+            self.weight_scale,
+            None,
+            pertoken,
+            None,
+            torch.bfloat16,
         )
 
 
@@ -520,6 +587,36 @@ class W8A8WeightLoader:
                 t = self.shard(t, dim=dim)
             self.copy_in(prefix + proj + "." + suffix, t)
 
+    def load_fused_w8a8_a(
+        self,
+        prefix: str,
+        target_proj: str,
+        source_projs: tuple[str, ...],
+    ) -> None:
+        """Load output-concatenated static W8A8 projections."""
+        for suffix in ("weight", "deq_scale", "quant_bias"):
+            tensors = [
+                self.load_tensor(prefix + proj + "." + suffix)
+                for proj in source_projs
+            ]
+            self.copy_in(
+                prefix + target_proj + "." + suffix,
+                torch.cat(tensors, dim=0).contiguous(),
+            )
+
+        for suffix in ("input_scale", "input_offset"):
+            tensors = [
+                self.load_tensor(prefix + proj + "." + suffix)
+                for proj in source_projs
+            ]
+            reference = tensors[0]
+            if any(not torch.equal(reference, tensor) for tensor in tensors[1:]):
+                names = ", ".join(source_projs)
+                raise ValueError(
+                    f"{prefix}{names} must share {suffix} for fused W8A8"
+                )
+            self.copy_in(prefix + target_proj + "." + suffix, reference)
+
     def load_w8a8_b(self, mlp_pfx: str) -> None:
         gw = self.load_tensor(mlp_pfx + "gate_proj.weight")
         gs = self.load_tensor(mlp_pfx + "gate_proj.weight_scale")
@@ -560,7 +657,9 @@ class DeepseekV3MLP(nn.Module):
         inter_local = intermediate_size // tp
         self.tp = tp
         self.skip_tp_reduce = skip_tp_reduce
-        self.gate_up_proj = W8A8DynamicLinear(cfg.hidden_size, 2 * inter_local, device)
+        self.gate_up_proj = W8A8DynamicLinear(
+            cfg.hidden_size, 2 * inter_local, device
+        )
         self.down_proj = W8A8DynamicLinear(
             inter_local,
             cfg.hidden_size,
@@ -625,17 +724,39 @@ class DeepseekV3MLAAttention(Attention):
         self.v_head_dim = v_head
         self.kv_lora_rank = kv_lora
         self.num_heads_local = num_heads
+        self.q_lora_rank = cfg.q_lora_rank
+        self._fused_qkv_a_proj = _FUSED_QKV_A_PROJ_ENABLED
 
-        self.q_a_proj = W8A8StaticLinear(cfg.hidden_size, cfg.q_lora_rank, device)
-        self.kv_a_proj_with_mqa = W8A8StaticLinear(cfg.hidden_size, kv_lora + qk_rope, device)
+        if self._fused_qkv_a_proj:
+            self.qkv_a_proj = W8A8StaticLinear(
+                cfg.hidden_size,
+                cfg.q_lora_rank + kv_lora + qk_rope,
+                device,
+            )
+            self.q_a_proj = None
+            self.kv_a_proj_with_mqa = None
+        else:
+            self.qkv_a_proj = None
+            self.q_a_proj = W8A8StaticLinear(
+                cfg.hidden_size, cfg.q_lora_rank, device
+            )
+            self.kv_a_proj_with_mqa = W8A8StaticLinear(
+                cfg.hidden_size, kv_lora + qk_rope, device
+            )
+        self.q_b_proj = W8A8StaticLinear(
+            cfg.q_lora_rank, num_heads * (qk_nope + qk_rope), device
+        )
+        self.o_proj = W8A8StaticLinear(
+            num_heads * v_head,
+            cfg.hidden_size,
+            device,
+            row_parallel=True,
+        )
         self.q_a_layernorm = RMSNorm(
             cfg.q_lora_rank, cfg.rms_norm_eps, dtype=dtype, device=device
         )
         self.kv_a_layernorm = RMSNorm(
             kv_lora, cfg.rms_norm_eps, dtype=dtype, device=device
-        )
-        self.q_b_proj = W8A8StaticLinear(
-            cfg.q_lora_rank, num_heads * (qk_nope + qk_rope), device
         )
         self.kv_b_proj = ColumnParallelLinear(
             kv_lora,
@@ -643,12 +764,6 @@ class DeepseekV3MLAAttention(Attention):
             tp,
             dtype=dtype,
             device=device,
-        )
-        self.o_proj = W8A8StaticLinear(
-            num_heads * v_head,
-            cfg.hidden_size,
-            device,
-            row_parallel=True,
         )
         self.register_buffer(
             "W_UK",
@@ -665,8 +780,14 @@ class DeepseekV3MLAAttention(Attention):
         )
 
     def process_weights_after_loading(self) -> None:
-        self.q_a_proj.process_weights_after_loading()
-        self.kv_a_proj_with_mqa.process_weights_after_loading()
+        if self._fused_qkv_a_proj:
+            assert self.qkv_a_proj is not None
+            self.qkv_a_proj.process_weights_after_loading()
+        else:
+            assert self.q_a_proj is not None
+            assert self.kv_a_proj_with_mqa is not None
+            self.q_a_proj.process_weights_after_loading()
+            self.kv_a_proj_with_mqa.process_weights_after_loading()
         self.q_b_proj.process_weights_after_loading()
         self.o_proj.process_weights_after_loading()
         w = self.kv_b_proj.weight.data
@@ -681,26 +802,128 @@ class DeepseekV3MLAAttention(Attention):
         self.W_UK.copy_(w_uk.contiguous())
         self.W_UV.copy_(w_uv.transpose(1, 2).contiguous())
 
+    def _project_qkv_a(
+        self, input_norm_quant: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._fused_qkv_a_proj:
+            assert self.qkv_a_proj is not None
+            qkv_a = self.qkv_a_proj.forward_quantized(input_norm_quant)
+            kv, q_a = qkv_a.split(
+                [
+                    self.kv_lora_rank + self.qk_rope_head_dim,
+                    self.q_lora_rank,
+                ],
+                dim=-1,
+            )
+            return q_a, kv
+        assert self.q_a_proj is not None
+        assert self.kv_a_proj_with_mqa is not None
+        return (
+            self.q_a_proj.forward_quantized(input_norm_quant),
+            self.kv_a_proj_with_mqa.forward_quantized(input_norm_quant),
+        )
+
     def forward(
         self,
         hidden: torch.Tensor,
-        positions: torch.Tensor,
-        cos_sin_cache: torch.Tensor,
+        half_rope_cos: torch.Tensor,
+        half_rope_sin: torch.Tensor,
+        rope_cos: torch.Tensor,
+        rope_sin: torch.Tensor,
     ) -> torch.Tensor:
         num_tokens = hidden.shape[0]
-        q_a = self.q_a_proj(hidden)
-        q_c = self.q_a_layernorm(q_a)
-        backend = get_forward_context().attention_backend
-        half_rope_cos, half_rope_sin = _gather_half_rope_cos_sin(
-            cos_sin_cache, positions
+        dump_mla_details = (
+            self.layer_id == 0
+            and bool(os.environ.get("XLLM_PYTHON_LAYER_DETAIL_DUMP_DIR"))
         )
+        input_proj = (
+            self.qkv_a_proj
+            if self._fused_qkv_a_proj
+            else self.q_a_proj
+        )
+        assert input_proj is not None
+        input_norm_quant = kernels.quantize_per_tensor(
+            hidden,
+            input_proj.input_scale,
+            input_proj.input_offset,
+            torch.qint8,
+            -1,
+        )
+        if dump_mla_details:
+            _dump_tensor_to_env_dir(
+                hidden,
+                "XLLM_PYTHON_LAYER_DETAIL_DUMP_DIR",
+                "layer_0_mla_input_norm_bf16.pt",
+            )
+            _dump_tensor_to_env_dir(
+                input_proj.input_scale,
+                "XLLM_PYTHON_LAYER_DETAIL_DUMP_DIR",
+                "layer_0_mla_input_norm_quant_scale.pt",
+            )
+            _dump_tensor_to_env_dir(
+                input_proj.input_offset,
+                "XLLM_PYTHON_LAYER_DETAIL_DUMP_DIR",
+                "layer_0_mla_input_norm_quant_offset.pt",
+            )
+            _dump_tensor_to_env_dir(
+                input_norm_quant,
+                "XLLM_PYTHON_LAYER_DETAIL_DUMP_DIR",
+                "layer_0_mla_input_norm_quant.pt",
+            )
+        q_a, kv = self._project_qkv_a(input_norm_quant)
+        if dump_mla_details:
+            _dump_tensor_to_env_dir(
+                q_a.unsqueeze(1),
+                "XLLM_PYTHON_LAYER_DETAIL_DUMP_DIR",
+                "layer_0_mla_q_a_out.pt",
+            )
+        q_c = self.q_a_layernorm(q_a)
+        q_a_norm_quant = kernels.quantize_per_tensor(
+            q_c,
+            self.q_b_proj.input_scale,
+            self.q_b_proj.input_offset,
+            torch.qint8,
+            -1,
+        )
+        if dump_mla_details:
+            _dump_tensor_to_env_dir(
+                q_c.unsqueeze(1),
+                "XLLM_PYTHON_LAYER_DETAIL_DUMP_DIR",
+                "layer_0_mla_q_a_norm_bf16.pt",
+            )
+            _dump_tensor_to_env_dir(
+                self.q_b_proj.input_scale,
+                "XLLM_PYTHON_LAYER_DETAIL_DUMP_DIR",
+                "layer_0_mla_q_a_norm_quant_scale.pt",
+            )
+            _dump_tensor_to_env_dir(
+                self.q_b_proj.input_offset,
+                "XLLM_PYTHON_LAYER_DETAIL_DUMP_DIR",
+                "layer_0_mla_q_a_norm_quant_offset.pt",
+            )
+            _dump_tensor_to_env_dir(
+                q_a_norm_quant.unsqueeze(1),
+                "XLLM_PYTHON_LAYER_DETAIL_DUMP_DIR",
+                "layer_0_mla_q_a_norm_quant.pt",
+            )
+        backend = get_forward_context().attention_backend
         topk = None
         if self.indexer is not None:
             ctx = backend.mla_index_context(self)
             topk = self.indexer.select_qli(
-                hidden, q_c, ctx, half_rope_cos, half_rope_sin
+                hidden,
+                q_c,
+                ctx,
+                half_rope_cos,
+                half_rope_sin,
             )
-        q = self.q_b_proj(q_c)
+        q = self.q_b_proj.forward_quantized(q_a_norm_quant)
+        if dump_mla_details:
+            _dump_tensor_to_env_dir(
+                q.unsqueeze(1),
+                "XLLM_PYTHON_LAYER_DETAIL_DUMP_DIR",
+                "layer_0_mla_q_b_out.pt",
+            )
         q = q.view(
             num_tokens,
             self.num_heads_local,
@@ -712,25 +935,23 @@ class DeepseekV3MLAAttention(Attention):
         q_latent = torch.bmm(
             q_nope.transpose(0, 1), self.W_UK
         ).transpose(0, 1)
-        cos, sin = _expand_interleave_rope_cos_sin(
-            half_rope_cos, half_rope_sin
-        )
-        q_pe = _interleave_rope_with(q_rope, cos, sin)
-        kv = self.kv_a_proj_with_mqa(hidden)
+        q_pe = _interleave_rope_with(q_rope, rope_cos, rope_sin)
         k_latent_raw, k_rope_raw = kv.split(
             [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
         k_latent = self.kv_a_layernorm(k_latent_raw)
-        k_pe = _interleave_rope_with(k_rope_raw.unsqueeze(1), cos, sin)
+        k_pe = _interleave_rope_with(
+            k_rope_raw.unsqueeze(1), rope_cos, rope_sin
+        )
         k_latent_3d = k_latent.view(num_tokens, 1, self.kv_lora_rank)
         k_pe_3d = k_pe.view(num_tokens, 1, self.qk_rope_head_dim)
 
         attn_out = backend.execute_mla(
             q_latent, q_pe, k_latent_3d, k_pe_3d, self, topk=topk
         )
-        v_full = torch.bmm(
+        v_full = _batch_matmul_transpose(
             attn_out.transpose(0, 1), self.W_UV
-        ).transpose(0, 1)
+        )
         v_full = v_full.reshape(
             num_tokens, self.num_heads_local * self.v_head_dim
         )
@@ -741,7 +962,7 @@ class DeepseekV3MLAAttention(Attention):
 
 
 class DeepseekV3Indexer(nn.Module):
-    """DeepSeek-V3.2 lightning indexer (bf16 weights, non-quant aclnnLightningIndexer)."""
+    """DeepSeek-V3.2 LightningIndexer with optional INT8 Q/K cache."""
 
     def __init__(self, cfg: "DeepseekV3Config", dtype: torch.dtype,
                  device: torch.device) -> None:
@@ -763,6 +984,11 @@ class DeepseekV3Indexer(nn.Module):
         )
         self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6,
                                    dtype=dtype, device=device)
+        self.register_buffer(
+            "hadamard",
+            _create_hadamard_matrix(self.head_dim, dtype, device),
+            persistent=False,
+        )
 
     def select_qli(
         self,
@@ -773,24 +999,63 @@ class DeepseekV3Indexer(nn.Module):
         half_rope_sin: torch.Tensor,
     ) -> torch.Tensor:
         q = self.wq_b(qr).view(-1, self.n_head, self.head_dim)
-        q_pe, q_nope = torch.split(
-            q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
-        )
         k, weights = self.wk_weights_proj(hidden).split(
             [self.head_dim, self.n_head], dim=-1
         )
         k = self.k_norm(k)
+        q_pe, q_nope = torch.split(
+            q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+        )
         k_pe, k_nope = torch.split(
             k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
         )
-        q_pe = _apply_half_rope_with_angles(q_pe, half_rope_cos, half_rope_sin)
+        q_pe = _apply_half_rope_with_angles(
+            q_pe, half_rope_cos, half_rope_sin
+        )
         k_pe = _apply_half_rope_with_angles(
             k_pe.unsqueeze(1), half_rope_cos, half_rope_sin
         ).squeeze(1)
         q = torch.cat([q_pe, q_nope], dim=-1)
         k = torch.cat([k_pe, k_nope], dim=-1)
+
+        use_quant_indexer = (
+            ctx.index_cache.dtype == torch.int8
+            and ctx.index_cache_scale is not None
+        )
+        if use_quant_indexer:
+            rotation_scale = self.head_dim ** -0.5
+            q = torch.matmul(q, self.hadamard) * rotation_scale
+            k = torch.matmul(k, self.hadamard) * rotation_scale
+            q, q_scale = kernels.dynamic_quant(q)
+            k, k_scale = kernels.dynamic_quant(k)
+            assert q_scale is not None
+            assert k_scale is not None
+            q_scale = q_scale.to(torch.float16)
+            k_scale = k_scale.unsqueeze(-1).to(torch.float16)
+            ctx.update_index_cache(k, k_scale)
+            weight_scale = self.head_dim ** -0.5 * self.n_head ** -0.5
+            # This cache stores one index key per source token. Unlike the
+            # vLLM-Ascend compressor path, no 4:1 token compression is used.
+            cmp_ratio = 1
+            qli_metadata = ctx.get_quant_indexer_metadata(
+                self.n_head, self.head_dim, self.topk, cmp_ratio
+            )
+            return kernels.quant_lightning_indexer(
+                q,
+                ctx.index_cache,
+                (weights * weight_scale).to(torch.float16),
+                q_scale,
+                ctx.index_cache_scale,
+                qli_metadata,
+                ctx.actual_seq_q,
+                ctx.actual_seq_kv,
+                ctx.block_table,
+                self.topk,
+                cmp_ratio,
+            )
+
         if ctx.index_cache is not None and ctx.slot_mapping is not None:
-            ctx.update_index_cache(k)
+            ctx.update_index_cache(k, None)
 
         key_head_num = ctx.index_cache.size(2) if ctx.index_cache.dim() >= 3 else 1
         output_shape = (q.size(0), key_head_num, self.topk)
@@ -916,8 +1181,19 @@ class DeepseekV3MoE(nn.Module):
             ),
         )
         shared_inter = cfg.moe_intermediate_size * cfg.n_shared_experts
-        self.shared_experts = DeepseekV3MLP(cfg, shared_inter, dtype, device,
-                                            skip_tp_reduce=True)
+        self.shared_experts = DeepseekV3MLP(
+            cfg,
+            shared_inter,
+            dtype,
+            device,
+            skip_tp_reduce=True,
+        )
+        self._expert_parallel_enabled = (
+            _moe_expert_overlap_enabled()
+            and hasattr(torch, "npu")
+            and device.type in ("npu", "privateuseone")
+        )
+        self._shared_expert_start_event: torch.npu.Event | None = None
 
     def process_weights_after_loading(self) -> None:
         assert torch.all(self.experts_w13_offset == 0), (
@@ -953,9 +1229,9 @@ class DeepseekV3MoE(nn.Module):
         ).contiguous()
         self.shared_experts.process_weights_after_loading()
 
-    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+    def _run_routed_experts(self, hidden: torch.Tensor) -> torch.Tensor:
         logits = self.gate(hidden.to(torch.float32))
-        routed = kernels.grouped_moe(
+        return kernels.grouped_moe(
             hidden,
             logits,
             self.experts_w13,
@@ -970,9 +1246,45 @@ class DeepseekV3MoE(nn.Module):
             # ATB applies this in its fused top-k before BF16 expert compute.
             self.routed_scaling,
         )
+
+    def _combine_expert_outputs(
+        self,
+        routed: torch.Tensor,
+        shared: torch.Tensor,
+    ) -> torch.Tensor:
         if self.cfg.tp_size > 1:
-            return self.shared_experts(hidden, tp_reduce_add=routed)
-        return routed + self.shared_experts(hidden)
+            output = shared + routed
+            distributed.all_reduce_(output)
+            return output
+        return routed + shared
+
+    def _ensure_expert_parallel_resources(self) -> None:
+        if self._shared_expert_start_event is not None:
+            return
+        self._shared_expert_start_event = torch.npu.Event()
+
+    def _forward_parallel(self, hidden: torch.Tensor) -> torch.Tensor:
+        self._ensure_expert_parallel_resources()
+        shared_stream = _shared_expert_stream(hidden.device)
+        start_event = self._shared_expert_start_event
+        assert start_event is not None
+
+        current_stream = torch.npu.current_stream()
+        start_event.record(current_stream)
+        shared_stream.wait_event(start_event)
+        with torch.npu.stream(shared_stream):
+            shared = self.shared_experts(hidden)
+
+        routed = self._run_routed_experts(hidden)
+        current_stream.wait_stream(shared_stream)
+        return self._combine_expert_outputs(routed, shared)
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        if self._expert_parallel_enabled:
+            return self._forward_parallel(hidden)
+        routed = self._run_routed_experts(hidden)
+        shared = self.shared_experts(hidden)
+        return self._combine_expert_outputs(routed, shared)
 
 
 class DeepseekV3DecoderLayer(nn.Module):
@@ -1003,17 +1315,45 @@ class DeepseekV3DecoderLayer(nn.Module):
         self,
         hidden: torch.Tensor,
         residual: Optional[torch.Tensor],
-        positions: torch.Tensor,
-        cos_sin_cache: torch.Tensor,
+        half_rope_cos: torch.Tensor,
+        half_rope_sin: torch.Tensor,
+        rope_cos: torch.Tensor,
+        rope_sin: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             residual = hidden
             hidden = self.input_layernorm(hidden)
         else:
             hidden, residual = self.input_layernorm(hidden, residual)
-        hidden = self.self_attn(hidden, positions, cos_sin_cache)
+        hidden = self.self_attn(
+            hidden,
+            half_rope_cos,
+            half_rope_sin,
+            rope_cos,
+            rope_sin,
+        )
+        _dump_tensor_to_env_dir(
+            hidden,
+            "XLLM_PYTHON_LAYER_DETAIL_DUMP_DIR",
+            f"layer_{self.layer_id}_attention_out.pt",
+        )
         hidden, residual = self.post_attention_layernorm(hidden, residual)
+        _dump_tensor_to_env_dir(
+            residual,
+            "XLLM_PYTHON_LAYER_DETAIL_DUMP_DIR",
+            f"layer_{self.layer_id}_attention_add_out.pt",
+        )
+        _dump_tensor_to_env_dir(
+            hidden,
+            "XLLM_PYTHON_LAYER_DETAIL_DUMP_DIR",
+            f"layer_{self.layer_id}_post_attention_norm_out.pt",
+        )
         hidden = self.mlp(hidden)
+        _dump_tensor_to_env_dir(
+            hidden,
+            "XLLM_PYTHON_LAYER_DETAIL_DUMP_DIR",
+            f"layer_{self.layer_id}_mlp_out.pt",
+        )
         return hidden, residual
 
 
@@ -1058,12 +1398,33 @@ class DeepseekV3Model(nn.Module):
         self, input_ids: torch.Tensor, positions: torch.Tensor
     ) -> torch.Tensor:
         hidden = self.embed_tokens(input_ids)
+        _dump_tensor_to_env_dir(
+            hidden, "XLLM_PYTHON_LAYER_DUMP_DIR", "embedding.pt"
+        )
         positions = positions.to(torch.int64).contiguous()
-        cos_sin_cache = self.rotary.cos_sin_cache
+        half_rope_cos, half_rope_sin, rope_cos, rope_sin = self.rotary(
+            positions
+        )
         residual: Optional[torch.Tensor] = None
-        for layer in self.layers:
-            hidden, residual = layer(hidden, residual, positions, cos_sin_cache)
+        for layer_index, layer in enumerate(self.layers):
+            hidden, residual = layer(
+                hidden,
+                residual,
+                half_rope_cos,
+                half_rope_sin,
+                rope_cos,
+                rope_sin,
+            )
+            assert residual is not None
+            _dump_tensor_to_env_dir(
+                hidden + residual,
+                "XLLM_PYTHON_LAYER_DUMP_DIR",
+                f"layer_{layer_index}.pt",
+            )
         hidden, last_hidden = self.norm(hidden, residual)
+        _dump_tensor_to_env_dir(
+            hidden, "XLLM_PYTHON_LAYER_DUMP_DIR", "final_hidden.pt"
+        )
         return hidden
 
 
@@ -1127,12 +1488,20 @@ class DeepseekV3ForCausalLM(PyModelBase):
             loader.copy_in(p + "post_attention_layernorm.weight",
                            loader.load_tensor(p + "post_attention_layernorm.weight"))
             attn = p + "self_attn."
-            loader.load_w8a8_a(attn, "q_a_proj")
+            attention = self.model.layers[i].self_attn
+            if attention._fused_qkv_a_proj:
+                loader.load_fused_w8a8_a(
+                    attn,
+                    "qkv_a_proj",
+                    ("kv_a_proj_with_mqa", "q_a_proj"),
+                )
+            else:
+                loader.load_w8a8_a(attn, "q_a_proj")
+                loader.load_w8a8_a(attn, "kv_a_proj_with_mqa")
             loader.copy_in(attn + "q_a_layernorm.weight",
                            loader.load_tensor(attn + "q_a_layernorm.weight"))
             loader.load_w8a8_a(attn, "q_b_proj",
                                {"weight": 0, "deq_scale": 0, "quant_bias": 0})
-            loader.load_w8a8_a(attn, "kv_a_proj_with_mqa")
             loader.copy_in(attn + "kv_a_layernorm.weight",
                            loader.load_tensor(attn + "kv_a_layernorm.weight"))
             loader.copy_in(attn + "kv_b_proj.weight",

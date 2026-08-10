@@ -27,6 +27,7 @@ from xllm.python.attention.expanded_decode_metadata import (
 if TYPE_CHECKING:
     from xllm.python.layers.attention import Attention
 
+
 @dataclass(frozen=True, slots=True)
 class LayerCache:
     """Every cache a layer may own, named rather than positional.
@@ -42,10 +43,11 @@ class LayerCache:
     index: torch.Tensor | None = None
     conv: torch.Tensor | None = None
     ssm: torch.Tensor | None = None
+    index_scale: torch.Tensor | None = None
 
 
 #: Field order of the tuple form, which is what the C++ executor hands over.
-_LAYER_CACHE_SLOTS = ("key", "value", "index", "conv", "ssm")
+_LAYER_CACHE_SLOTS = ("key", "value", "index", "conv", "ssm", "index_scale")
 
 LayerCacheInput = LayerCache | tuple[torch.Tensor | None, ...]
 
@@ -62,8 +64,10 @@ def normalize_layer_caches(caches: Sequence[LayerCacheInput]) -> list[LayerCache
                 "layer cache must hold between K/V and "
                 f"{'/'.join(_LAYER_CACHE_SLOTS)} tensors"
             )
-        slots = [None if tensor is None or not tensor.numel() else tensor
-                 for tensor in cache]
+        slots = [
+            None if tensor is None or not tensor.numel() else tensor
+            for tensor in cache
+        ]
         slots.extend([None] * (len(_LAYER_CACHE_SLOTS) - len(slots)))
         normalized.append(LayerCache(*slots))
     return normalized
@@ -107,7 +111,11 @@ class MlaIndexContext:
     block_table: torch.Tensor | None
     actual_seq_q: torch.Tensor
     actual_seq_kv: torch.Tensor
-    update_index_cache: Callable[[torch.Tensor], None]
+    index_cache_scale: torch.Tensor | None
+    get_quant_indexer_metadata: Callable[[int, int, int, int], torch.Tensor]
+    update_index_cache: Callable[
+        [torch.Tensor, torch.Tensor | None], None
+    ]
 
 
 class AttentionBackend(ABC):

@@ -17,11 +17,32 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <cstdlib>
+
 #include "core/framework/config/load_config.h"
 #include "core/framework/config/parallel_config.h"
+#include "core/util/tensor_helper.h"
 
 namespace xllm {
 namespace layer {
+namespace {
+
+const char* get_dump_path(const char* env_name) {
+  const char* path = std::getenv(env_name);
+  return path != nullptr && path[0] != '\0' ? path : nullptr;
+}
+
+void dump_tensor_if_requested(const torch::Tensor& tensor,
+                              const char* env_name) {
+  const char* path = get_dump_path(env_name);
+  if (path == nullptr) {
+    return;
+  }
+  save_tensor_as_pickle(tensor.detach().cpu(), path);
+  LOG(INFO) << "Dumped " << env_name << " to " << path;
+}
+
+}  // namespace
 
 void NpuLmHeadImpl::param_from_args(atb_speed::common::LmHeadParam& param,
                                     const ModelArgs& args,
@@ -191,6 +212,14 @@ torch::Tensor NpuLmHeadImpl::forward_with_hidden(
   if (atOutTensors_.size() > 1) {
     out_hidden = atOutTensors_[1];
   }
+  if (get_dump_path("XLLM_CPP_HIDDEN_DUMP_PATH") != nullptr) {
+    torch::Tensor selected_hidden = hidden_states;
+    if (seleted_idxes.defined() && seleted_idxes.numel() > 0) {
+      selected_hidden = hidden_states.index_select(0, seleted_idxes);
+    }
+    dump_tensor_if_requested(selected_hidden, "XLLM_CPP_HIDDEN_DUMP_PATH");
+  }
+  dump_tensor_if_requested(output, "XLLM_CPP_LOGITS_DUMP_PATH");
   return output;
 }
 

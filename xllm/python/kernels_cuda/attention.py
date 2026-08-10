@@ -30,7 +30,8 @@ def batch_matmul_transpose(
     x: torch.Tensor, weight: torch.Tensor
 ) -> torch.Tensor:
     """Portable fallback for the NPU MLA value projection."""
-    return torch.bmm(x, weight)
+    return torch.bmm(x, weight).transpose(0, 1)
+
 
 __all__ = [
     "reshape_paged_cache",

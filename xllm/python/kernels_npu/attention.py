@@ -20,10 +20,21 @@ graph can replay them without re-planning.
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 reshape_paged_cache = torch.ops.xllm_ops.reshape_paged_cache
 update_decode_graph_metadata = torch.ops.xllm_ops.update_decode_graph_metadata
+_TRANSPOSE_BATCHMATMUL_ENABLED = os.environ.get(
+    "XLLM_TRANSPOSE_BATCHMATMUL",
+    "1",
+).strip().lower() not in ("0", "false", "off")
+_TRANSPOSE_BATCHMATMUL = (
+    getattr(torch.ops.npu, "npu_transpose_batchmatmul", None)
+    if _TRANSPOSE_BATCHMATMUL_ENABLED
+    else None
+)
 
 
 def batch_matmul_transpose(
@@ -35,11 +46,12 @@ def batch_matmul_transpose(
     The dedicated NPU operator avoids materializing a transpose and is the
     same path used by vLLM-Ascend for ``W_UV``.
     """
-    if x.device.type != "npu":
-        return torch.bmm(x, weight)
-    return torch.ops.npu.npu_transpose_batchmatmul(
+    if x.device.type != "npu" or _TRANSPOSE_BATCHMATMUL is None:
+        return torch.bmm(x, weight).transpose(0, 1)
+    return _TRANSPOSE_BATCHMATMUL(
         x, weight, perm_y=(1, 0, 2)
     )
+
 
 __all__ = [
     "reshape_paged_cache",

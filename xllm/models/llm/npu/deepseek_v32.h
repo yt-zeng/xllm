@@ -15,8 +15,11 @@ limitations under the License.
 
 #pragma once
 
+#include <cstdlib>
+
 #include "core/framework/model/model_output.h"
 #include "core/layers/npu/npu_deepseek_v32_decoder_layer_impl.h"
+#include "core/util/tensor_helper.h"
 #include "llm_model_base.h"
 
 // DeepSeek v32 compatible with huggingface weights
@@ -277,6 +280,13 @@ class DeepseekV32ModelImpl : public torch::nn::Module {
     }
 
     auto h = npu_embed_tokens_(tokens, 0);
+    const char* layer_dump_dir = std::getenv("XLLM_CPP_LAYER_DUMP_DIR");
+    const bool dump_layers =
+        layer_dump_dir != nullptr && layer_dump_dir[0] != '\0';
+    if (dump_layers) {
+      save_tensor_as_pickle(h.detach().cpu(),
+                            std::string(layer_dump_dir) + "/embedding.pt");
+    }
     const NpuCpPlan& cp_plan = input_params.parallel.cp_plan;
     if (cp_plan.enabled()) {
       cp_plan.shard_model_input(h, positions);
@@ -363,11 +373,20 @@ class DeepseekV32ModelImpl : public torch::nn::Module {
         prev_topk_indices = current_topk_indices;
       }
       rolling_guard.after_layer(layer_index);
+      if (dump_layers) {
+        save_tensor_as_pickle(h.detach().cpu(),
+                              std::string(layer_dump_dir) + "/layer_" +
+                                  std::to_string(layer_index) + ".pt");
+      }
     }
     if (cp_plan.enabled()) {
       h = cp_plan.merge_model_output(h);
     }
     auto hidden_states = norm_(h, 0);
+    if (dump_layers) {
+      save_tensor_as_pickle(hidden_states.detach().cpu(),
+                            std::string(layer_dump_dir) + "/final_hidden.pt");
+    }
     return ModelOutput(hidden_states);
   }
 

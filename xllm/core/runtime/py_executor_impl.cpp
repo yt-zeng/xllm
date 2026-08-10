@@ -136,11 +136,18 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
     py::list kv_caches_py;
     for (auto& kv : kv_caches) {
       // Slot order must match ``LayerCache`` on the Python side.
+      const std::optional<torch::Tensor> indexer_cache_scale =
+          kv.get_indexer_cache_scale();
+      py::object indexer_cache_scale_py =
+          indexer_cache_scale.has_value()
+              ? py::cast(indexer_cache_scale.value())
+              : py::none();
       kv_caches_py.append(py::make_tuple(optional_tensor(kv.get_k_cache()),
                                          optional_tensor(kv.get_v_cache()),
                                          optional_tensor(kv.get_index_cache()),
                                          optional_tensor(kv.get_conv_cache()),
-                                         optional_tensor(kv.get_ssm_cache())));
+                                         optional_tensor(kv.get_ssm_cache()),
+                                         indexer_cache_scale_py));
     }
     py_executor_.attr("bind_kv_caches")(kv_caches_py);
     kv_bound_ = true;
