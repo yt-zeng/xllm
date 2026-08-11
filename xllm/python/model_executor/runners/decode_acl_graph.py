@@ -87,6 +87,8 @@ class _DecodeGraphEntry:
         "static_input_ids",
         "static_positions",
         "static_input_embedding",
+        "static_mtp_topk_state",
+        "static_mtp_topk_output",
         "static_metadata",
         "kv_seq_lens_delta",
         "graph_tasks",
@@ -97,6 +99,9 @@ class _DecodeGraphEntry:
 _GraphKey = tuple[
     int,
     bool,
+    torch.dtype | None,
+    torch.device | None,
+    tuple[int, ...] | None,
     torch.dtype | None,
     torch.device | None,
     tuple[int, ...] | None,
@@ -130,6 +135,7 @@ class DecodeAclGraphRunner(BaseRunner):
         input_ids: torch.Tensor,
         metadata: AttentionMetadata,
         input_embedding: torch.Tensor | None = None,
+        mtp_topk_state: torch.Tensor | None = None,
     ) -> bool:
         if input_ids.dim() != 1:
             return False
@@ -147,6 +153,10 @@ class DecodeAclGraphRunner(BaseRunner):
             and (
                 input_embedding is None
                 or input_embedding.shape[0] == batch_size
+            )
+            and (
+                mtp_topk_state is None
+                or mtp_topk_state.shape[0] == batch_size
             )
             and bucket_size <= self.max_batch
         )
@@ -430,7 +440,8 @@ class DecodeAclGraphRunner(BaseRunner):
         positions: torch.Tensor,
         metadata: AttentionMetadata,
         input_embedding: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        mtp_topk_state: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         batch_size = input_ids.shape[0]
         padded_batch_size = _decode_bucket(batch_size)
         if padded_batch_size > self.max_batch:
@@ -438,7 +449,10 @@ class DecodeAclGraphRunner(BaseRunner):
 
         is_expanded = resolve_expanded_decode_metadata(metadata) is not None
         graph_key = self._graph_key(
-            padded_batch_size, is_expanded, input_embedding
+            padded_batch_size,
+            is_expanded,
+            input_embedding,
+            mtp_topk_state,
         )
         entry = self._graphs.get(graph_key)
         first_capture = entry is None
@@ -459,7 +473,13 @@ class DecodeAclGraphRunner(BaseRunner):
         assert self._replay_done_event is not None
 
         self._fill_entry(
-            entry, input_ids, positions, metadata, batch_size, input_embedding
+            entry,
+            input_ids,
+            positions,
+            metadata,
+            batch_size,
+            input_embedding,
+            mtp_topk_state,
         )
 
         prepare_context = ForwardContext(
@@ -497,6 +517,11 @@ class DecodeAclGraphRunner(BaseRunner):
         self._replay_done_event.record(self._stream)
 
         torch.npu.current_stream().wait_stream(self._stream)
+        static_mtp_topk_output = getattr(
+            entry, "static_mtp_topk_output", None
+        )
+        if static_mtp_topk_output is not None:
+            return output, static_mtp_topk_output[:batch_size]
         return output
 
     @staticmethod
@@ -504,16 +529,32 @@ class DecodeAclGraphRunner(BaseRunner):
         padded_batch_size: int,
         is_expanded: bool,
         input_embedding: torch.Tensor | None,
+        mtp_topk_state: torch.Tensor | None = None,
     ) -> _GraphKey:
         """Return the key for a shape- and metadata-specific graph."""
-        if input_embedding is None:
-            return padded_batch_size, is_expanded, None, None, None
+        embedding_signature = (
+            (None, None, None)
+            if input_embedding is None
+            else (
+                input_embedding.dtype,
+                input_embedding.device,
+                tuple(input_embedding.shape[1:]),
+            )
+        )
+        topk_signature = (
+            (None, None, None)
+            if mtp_topk_state is None
+            else (
+                mtp_topk_state.dtype,
+                mtp_topk_state.device,
+                tuple(mtp_topk_state.shape[1:]),
+            )
+        )
         return (
             padded_batch_size,
             is_expanded,
-            input_embedding.dtype,
-            input_embedding.device,
-            tuple(input_embedding.shape[1:]),
+            *embedding_signature,
+            *topk_signature,
         )
 
     def _allocate_entry(
@@ -564,6 +605,8 @@ class DecodeAclGraphRunner(BaseRunner):
             padded_batch_size, dtype=torch.int32, device=device
         )
         entry.static_input_embedding = None
+        entry.static_mtp_topk_state = None
+        entry.static_mtp_topk_output = None
         entry.static_metadata = _StaticAttentionMetadata(
             slot_mapping=torch.zeros(
                 padded_batch_size,
@@ -631,6 +674,7 @@ class DecodeAclGraphRunner(BaseRunner):
         metadata: AttentionMetadata,
         batch_size: int,
         input_embedding: torch.Tensor | None,
+        mtp_topk_state: torch.Tensor | None,
     ) -> None:
         padded_batch_size = entry.batch_size
         static_metadata = entry.static_metadata
@@ -705,6 +749,30 @@ class DecodeAclGraphRunner(BaseRunner):
         elif entry.static_input_embedding is not None:
             entry.static_input_embedding.zero_()
 
+        if mtp_topk_state is not None:
+            if mtp_topk_state.shape[0] != batch_size:
+                raise ValueError(
+                    "ACL graph MTP top-k rows must match input_ids"
+                )
+            if entry.static_mtp_topk_state is None:
+                entry.static_mtp_topk_state = torch.zeros(
+                    (entry.batch_size, *mtp_topk_state.shape[1:]),
+                    dtype=mtp_topk_state.dtype,
+                    device=mtp_topk_state.device,
+                )
+            elif (
+                entry.static_mtp_topk_state.shape[1:]
+                != mtp_topk_state.shape[1:]
+            ):
+                raise ValueError(
+                    "ACL graph MTP top-k shape changed for a graph bucket"
+                )
+            entry.static_mtp_topk_state[:batch_size].copy_(mtp_topk_state)
+            if entry.batch_size > batch_size:
+                entry.static_mtp_topk_state[batch_size:].zero_()
+        elif entry.static_mtp_topk_state is not None:
+            entry.static_mtp_topk_state.zero_()
+
         if static_metadata.block_table is not None:
             src_bt = block_table
             copy_cols = min(
@@ -775,9 +843,19 @@ class DecodeAclGraphRunner(BaseRunner):
         with forward_context(context):
             with torch.npu.graph(entry.graph, stream=self._stream):
                 entry.static_output = self._forward_static(entry)
+        entry.static_mtp_topk_output = getattr(
+            self.model, "mtp_topk_state", None
+        )
         entry.graph_tasks = capture_context.tasks
 
     def _forward_static(self, entry: _DecodeGraphEntry) -> torch.Tensor:
+        if entry.static_mtp_topk_state is not None:
+            return self.model(
+                entry.static_input_ids,
+                entry.static_positions,
+                entry.static_input_embedding,
+                entry.static_mtp_topk_state,
+            )
         if entry.static_input_embedding is None:
             return self.model(entry.static_input_ids, entry.static_positions)
         return self.model(

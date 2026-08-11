@@ -23,10 +23,12 @@ limitations under the License.
 #include <algorithm>
 #include <memory>
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include "common/metrics.h"
 #include "core/framework/config/execution_config.h"
+#include "core/framework/model/mtp_topk_state.h"
 #include "core/layers/common/attention_metadata.h"
 #include "core/layers/common/attention_metadata_builder.h"
 #include "core/runtime/py_attention_metadata.h"
@@ -42,6 +44,36 @@ namespace py = pybind11;
 
 namespace xllm {
 namespace {
+
+class PyMtpTopkState final : public MtpTopkState {
+ public:
+  explicit PyMtpTopkState(torch::Tensor topk_indices)
+      : topk_indices_(std::move(topk_indices)) {
+    CHECK(topk_indices_.defined())
+        << "Python MTP DSA top-k indices must be defined.";
+    CHECK_GE(topk_indices_.dim(), 1)
+        << "Python MTP DSA top-k indices must have at least one dimension.";
+  }
+
+  const torch::Tensor& topk_indices() const { return topk_indices_; }
+
+  int64_t num_rows() const override { return topk_indices_.size(0); }
+
+  torch::Device device() const override { return topk_indices_.device(); }
+
+  MtpTopkStatePtr to(const torch::Device& device) const override {
+    return std::make_shared<PyMtpTopkState>(topk_indices_.to(
+        topk_indices_.options().device(device), /*non_blocking=*/true));
+  }
+
+  MtpTopkStatePtr index_select_rows(const torch::Tensor& index) const override {
+    return std::make_shared<PyMtpTopkState>(
+        topk_indices_.index_select(/*dim=*/0, index));
+  }
+
+ private:
+  torch::Tensor topk_indices_;
+};
 
 py::object optional_tensor(const torch::Tensor& tensor) {
   return tensor.defined() ? py::cast(tensor) : py::none();
@@ -162,6 +194,14 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
   py::object input_embedding = params.embedding.input_embedding.defined()
                                    ? py::cast(params.embedding.input_embedding)
                                    : py::none();
+  py::object mtp_topk_state = py::none();
+  if (params.mtp_topk_state != nullptr) {
+    const auto state =
+        std::dynamic_pointer_cast<const PyMtpTopkState>(params.mtp_topk_state);
+    CHECK(state != nullptr)
+        << "Python MTP model received an incompatible top-k state.";
+    mtp_topk_state = py::cast(state->topk_indices());
+  }
 
   py::object py_sync = py::none();
 #if defined(USE_NPU)
@@ -171,9 +211,21 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
 #endif
 
   // Execute: one C++ -> Python call per step.
-  py::object hidden_obj = py_executor_.attr("execute")(
-      tokens, positions, py_metadata, input_embedding, py_sync);
-  return ModelOutput(hidden_obj.cast<torch::Tensor>());
+  py::object result = py_executor_.attr("execute")(
+      tokens, positions, py_metadata, input_embedding, mtp_topk_state, py_sync);
+  if (!py::isinstance<py::tuple>(result)) {
+    return ModelOutput(result.cast<torch::Tensor>());
+  }
+
+  py::tuple output_tuple = result.cast<py::tuple>();
+  CHECK_EQ(output_tuple.size(), 2)
+      << "Python model execute tuple must contain hidden states and MTP top-k.";
+  ModelOutput output(output_tuple[0].cast<torch::Tensor>());
+  if (!output_tuple[1].is_none()) {
+    output.mtp_topk_state =
+        std::make_shared<PyMtpTopkState>(output_tuple[1].cast<torch::Tensor>());
+  }
+  return output;
 }
 
 }  // namespace xllm

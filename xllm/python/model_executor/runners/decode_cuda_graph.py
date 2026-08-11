@@ -113,10 +113,12 @@ class DecodeCudaGraphRunner(BaseRunner):
         input_ids: torch.Tensor,
         metadata: AttentionMetadata,
         input_embedding: torch.Tensor | None = None,
+        mtp_topk_state: torch.Tensor | None = None,
     ) -> bool:
         graph_key = self._graph_key(input_ids, metadata)
         return (
             input_embedding is None
+            and mtp_topk_state is None
             and not metadata.is_prefill
             and not metadata.is_chunked_prefill
             and graph_key is not None
@@ -198,7 +200,10 @@ class DecodeCudaGraphRunner(BaseRunner):
         positions: torch.Tensor,
         metadata: AttentionMetadata,
         input_embedding: torch.Tensor | None = None,
+        mtp_topk_state: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if mtp_topk_state is not None:
+            raise ValueError("CUDA graph does not support MTP top-k state")
         batch_size = input_ids.shape[0]
         graph_key = self._graph_key(input_ids, metadata)
         if graph_key is None:

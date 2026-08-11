@@ -20,8 +20,7 @@ GLM-5.2 structural deltas live here:
 
   * cross-layer top-k sharing -- ``indexer_types`` marks full/shared layers;
     shared layers skip the indexer and reuse the previous full layer's top-k.
-  * indexer ``wq_b`` is W8A8 (not bf16 ``nn.Linear``) and ``weights_proj``
-    stays fp32.
+  * indexer ``wq_b`` remains BF16 while ``weights_proj`` executes in fp32.
   * indexer RoPE is configurable (``indexer_rope_interleave``); DSV3.2's
     indexer uses half-rotate only.
   * per-layer MLP type comes from ``mlp_layer_types`` (not a single
@@ -47,7 +46,10 @@ from xllm.python.layers import (
     RMSNorm,
     RowParallelLinear,
 )
-from xllm.python.model_executor.forward_context import get_forward_context
+from xllm.python.model_executor.forward_context import (
+    get_execution_buffer,
+    get_forward_context,
+)
 from xllm.python.models.base import PyModelBase
 from xllm.python.models.deepseek_v32 import (
     DeepseekV3MLP as Glm52MLP,
@@ -57,6 +59,8 @@ from xllm.python.models.deepseek_v32 import (
     W8A8StaticLinear,
     W8A8WeightLoader,
     _apply_half_rope,
+    _batch_matmul_transpose,
+    _create_hadamard_matrix,
     _gather_interleave_cos_sin,
     _interleave_rope_with,
     _tp_rank_from_device,
@@ -320,8 +324,13 @@ class Glm52MLAAttention(Attention):
             and layer_id < len(cfg.indexer_types)
             and cfg.indexer_types[layer_id] == "shared"
         )
+        self.has_mtp_topk_fallback = (
+            self.is_shared
+            and cfg.model_type.endswith("_mtp")
+            and cfg.index_share_for_mtp_iteration
+        )
         self.indexer = None
-        if not self.is_shared:
+        if not self.is_shared or self.has_mtp_topk_fallback:
             self.indexer = Glm52Indexer(cfg, dtype, device)
 
     def process_weights_after_loading(self) -> None:
@@ -354,7 +363,9 @@ class Glm52MLAAttention(Attention):
         q_a = self.q_a_proj(hidden)
         q_c = self.q_a_layernorm(q_a)
         backend = get_forward_context().attention_backend
-        if self.indexer is not None:
+        if self.is_shared and prev_topk_indices is not None:
+            topk = prev_topk_indices
+        elif self.indexer is not None:
             ctx = backend.mla_index_context(self)
             topk = self.indexer.select_qli(
                 hidden, q_c, positions, ctx, cos_sin_cache
@@ -375,9 +386,9 @@ class Glm52MLAAttention(Attention):
         q_nope, q_rope = q.split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
         )
-        q_latent = torch.bmm(
+        q_latent = _batch_matmul_transpose(
             q_nope.transpose(0, 1), self.W_UK
-        ).transpose(0, 1)
+        )
         cos, sin = _gather_interleave_cos_sin(cos_sin_cache, positions)
         q_pe = _interleave_rope_with(q_rope, cos, sin)
         kv = self.kv_a_proj_with_mqa(hidden)
@@ -392,9 +403,9 @@ class Glm52MLAAttention(Attention):
         attn_out = backend.execute_mla(
             q_latent, q_pe, k_latent_3d, k_pe_3d, self, topk=topk
         )
-        v_full = torch.bmm(
+        v_full = _batch_matmul_transpose(
             attn_out.transpose(0, 1), self.W_UV
-        ).transpose(0, 1)
+        )
         v_full = v_full.reshape(
             num_tokens, self.num_heads_local * self.v_head_dim
         )
@@ -405,7 +416,7 @@ class Glm52MLAAttention(Attention):
 
 
 class Glm52Indexer(nn.Module):
-    """GLM-5.2 DSA lightning indexer (wq_b W8A8, weights_proj fp32, configurable RoPE)."""
+    """GLM-5.2 DSA indexer with BF16 wq_b and FP32 score weights."""
 
     def __init__(self, cfg: Glm52Config, dtype: torch.dtype,
                  device: torch.device) -> None:
@@ -415,8 +426,13 @@ class Glm52Indexer(nn.Module):
         self.rope_dim = cfg.qk_rope_head_dim
         self.topk = cfg.index_topk
         self.indexer_rope_interleave = cfg.indexer_rope_interleave
-        self.wq_b = W8A8StaticLinear(cfg.q_lora_rank, self.n_head * self.head_dim,
-                                     device)
+        self.wq_b = nn.Linear(
+            cfg.q_lora_rank,
+            self.n_head * self.head_dim,
+            bias=False,
+            dtype=dtype,
+            device=device,
+        )
         self.wk = nn.Linear(cfg.hidden_size, self.head_dim,
                             bias=False, dtype=dtype, device=device)
         self.weights_proj = nn.Linear(cfg.hidden_size, self.n_head,
@@ -424,9 +440,14 @@ class Glm52Indexer(nn.Module):
                                       device=device)
         self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6,
                                    dtype=dtype, device=device)
+        self.register_buffer(
+            "hadamard",
+            _create_hadamard_matrix(self.head_dim, dtype, device),
+            persistent=False,
+        )
 
     def process_weights_after_loading(self) -> None:
-        self.wq_b.process_weights_after_loading()
+        pass
 
     def select_qli(
         self,
@@ -463,15 +484,67 @@ class Glm52Indexer(nn.Module):
             ).squeeze(1)
         q = torch.cat([q_pe, q_nope], dim=-1)
         k = torch.cat([k_pe, k_nope], dim=-1)
+        weights = self.weights_proj(hidden.to(torch.float32))
+        use_quant_indexer = (
+            index_cache.dtype == torch.int8
+            and ctx.index_cache_scale is not None
+        )
+        if use_quant_indexer:
+            rotation_scale = self.head_dim ** -0.5
+            q = torch.matmul(q, self.hadamard) * rotation_scale
+            k = torch.matmul(k, self.hadamard) * rotation_scale
+            q, q_scale = kernels.dynamic_quant(q)
+            k, k_scale = kernels.dynamic_quant(k)
+            assert q_scale is not None
+            assert k_scale is not None
+            q_scale = q_scale.to(torch.float16)
+            k_scale = k_scale.unsqueeze(-1).to(torch.float16)
+            ctx.update_index_cache(k, k_scale)
+            weight_scale = self.head_dim ** -0.5 * self.n_head ** -0.5
+            cmp_ratio = 1
+            qli_metadata = ctx.get_quant_indexer_metadata(
+                self.n_head, self.head_dim, self.topk, cmp_ratio
+            )
+            return kernels.quant_lightning_indexer(
+                q,
+                index_cache,
+                (weights * weight_scale).to(torch.float16),
+                q_scale,
+                ctx.index_cache_scale,
+                qli_metadata,
+                actual_seq_q,
+                actual_seq_kv,
+                block_table,
+                self.topk,
+                cmp_ratio,
+            )
+
         if index_cache is not None and slot_mapping is not None:
             ctx.update_index_cache(k, None)
-        weights = self.weights_proj(hidden.to(torch.float32)).to(torch.bfloat16)
-        topk = kernels.lightning_indexer(
+        weights = weights.to(torch.bfloat16)
+        key_head_num = (
+            index_cache.size(2) if index_cache.dim() >= 3 else 1
+        )
+        output_shape = (q.size(0), key_head_num, self.topk)
+        buffer_key = tuple(output_shape)
+        topk_buffer = get_execution_buffer(
+            ("LIGHTNING_INDEXER_INDICES",) + buffer_key,
+            lambda: torch.empty(
+                output_shape, dtype=torch.int32, device=q.device
+            ),
+        )
+        values_buffer = get_execution_buffer(
+            ("LIGHTNING_INDEXER_VALUES",) + buffer_key,
+            lambda: torch.empty(
+                output_shape, dtype=q.dtype, device=q.device
+            ),
+        )
+        topk = kernels.lightning_indexer_out(
             q, index_cache, weights,
             actual_seq_q, actual_seq_kv, block_table,
             "TND", "PA_BSND", self.topk, 3,
             9223372036854775807, 9223372036854775807,
-            False,
+            False, topk_buffer, values_buffer,
         )
         return topk
 
@@ -583,7 +656,7 @@ class Glm52Model(nn.Module):
 class Glm52ForCausalLM(PyModelBase):
     """GLM-5.2 causal LM. Registered under ``model_type='glm_moe_dsa'``."""
 
-    def __init__(self, config: dict) -> None:
+    def __init__(self, config: dict, build_model: bool = True) -> None:
         super().__init__()
         self.cfg = Glm52Config.from_dict(config)
         self.cfg.tp_size = int(config.get("tp_size", 1))
@@ -597,14 +670,21 @@ class Glm52ForCausalLM(PyModelBase):
         self.device = device
         tp = self.cfg.tp_size
         assert self.cfg.vocab_size % tp == 0
-        self.model = Glm52Model(self.cfg, dtype, device)
+        self.model: Optional[nn.Module] = None
+        self.lm_head: Optional[nn.Module] = None
+        if build_model:
+            self._build_model()
+
+    def _build_model(self) -> None:
+        tp = self.cfg.tp_size
+        self.model = Glm52Model(self.cfg, self.dtype, self.device)
         self.lm_head = ColumnParallelLinear(
             self.cfg.hidden_size,
             self.cfg.vocab_size // tp,
             tp,
             gather_output=True,
-            dtype=dtype,
-            device=device,
+            dtype=self.dtype,
+            device=self.device,
         )
 
     def load_weights(
@@ -612,12 +692,19 @@ class Glm52ForCausalLM(PyModelBase):
         state_dicts: list,
         tp_rank: int,
         tp_size: int,
+        load_lm_head: bool = True,
+        load_embedding: bool = True,
     ) -> None:
         cfg = self.cfg
         loader = W8A8WeightLoader(self, state_dicts, cfg.tp_size, cfg.tp_rank)
 
-        loader.copy_in("model.embed_tokens.weight",
-                       loader.shard(loader.load_tensor("model.embed_tokens.weight"), dim=1))
+        if load_embedding:
+            loader.copy_in(
+                "model.embed_tokens.weight",
+                loader.shard(
+                    loader.load_tensor("model.embed_tokens.weight"), dim=1
+                ),
+            )
 
         for i in range(cfg.n_layers):
             p = f"model.layers.{i}."
@@ -637,9 +724,12 @@ class Glm52ForCausalLM(PyModelBase):
             loader.copy_in(attn + "kv_b_proj.weight",
                            loader.shard(loader.load_tensor(attn + "kv_b_proj.weight"), dim=0))
             loader.load_w8a8_a(attn, "o_proj", {"weight": 1})
-            if not self.model.layers[i].self_attn.is_shared:
+            if self.model.layers[i].self_attn.indexer is not None:
                 idx = attn + "indexer."
-                loader.load_w8a8_a(idx, "wq_b")
+                loader.copy_in(
+                    idx + "wq_b.weight",
+                    loader.load_tensor(idx + "wq_b.weight"),
+                )
                 loader.copy_in(idx + "wk.weight", loader.load_tensor(idx + "wk.weight"))
                 loader.copy_in(idx + "k_norm.weight",
                                loader.load_tensor(idx + "k_norm.weight"))
@@ -687,5 +777,8 @@ class Glm52ForCausalLM(PyModelBase):
                 self.model.layers[i].mlp.process_weights_after_loading()
 
         loader.copy_in("model.norm.weight", loader.load_tensor("model.norm.weight"))
-        loader.copy_in("lm_head.weight",
-                       loader.shard(loader.load_tensor("lm_head.weight"), dim=0))
+        if load_lm_head:
+            loader.copy_in(
+                "lm_head.weight",
+                loader.shard(loader.load_tensor("lm_head.weight"), dim=0),
+            )

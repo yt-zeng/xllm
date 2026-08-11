@@ -192,33 +192,52 @@ class ModelExecutor:
         positions: torch.Tensor,
         metadata: AttentionMetadata,
         input_embedding: torch.Tensor | None = None,
+        mtp_topk_state: torch.Tensor | None = None,
         layer_synchronizer: LayerSynchronizer | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if not self._kv_bound:
             raise RuntimeError("KV caches are not bound")
 
         graph_runner = self.decode_graph_runner
         if graph_runner is not None and graph_runner.can_execute(
-            input_ids, metadata, input_embedding
+            input_ids, metadata, input_embedding, mtp_topk_state
         ):
             graph_runner.warmup(
                 input_ids.device, input_ids.dtype, input_embedding
             )
-            return graph_runner.execute(
-                input_ids, positions, metadata, input_embedding
-            )
-        if self.inductor_runner is not None:
-            return self.inductor_runner.execute(
+            runner_output = graph_runner.execute(
                 input_ids,
                 positions,
                 metadata,
                 input_embedding,
+                mtp_topk_state,
+            )
+        elif self.inductor_runner is not None:
+            runner_output = self.inductor_runner.execute(
+                input_ids,
+                positions,
+                metadata,
+                input_embedding,
+                mtp_topk_state,
                 layer_synchronizer,
             )
-        return self.eager_runner.execute(
-            input_ids,
-            positions,
-            metadata,
-            input_embedding,
-            layer_synchronizer,
-        )
+        else:
+            runner_output = self.eager_runner.execute(
+                input_ids,
+                positions,
+                metadata,
+                input_embedding,
+                mtp_topk_state,
+                layer_synchronizer,
+            )
+
+        if isinstance(runner_output, tuple):
+            output, output_topk_state = runner_output
+        else:
+            output = runner_output
+            output_topk_state = getattr(
+                self.model.model, "mtp_topk_state", None
+            )
+        if output_topk_state is None:
+            return output
+        return output, output_topk_state[: input_ids.shape[0]]

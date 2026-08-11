@@ -70,5 +70,19 @@ TEST(NpuCpCapabilityTest, RegistrationIsIdempotent) {
   }
 }
 
+TEST(NpuCpCapabilityTest, GlmMtpSupportsTorchBackend) {
+  std::string effective_backend;
+  std::string resolved_name;
+  std::string error_message;
+  EXPECT_TRUE(resolve_model_registration("glm_moe_dsa_mtp",
+                                         "TORCH",
+                                         &effective_backend,
+                                         &resolved_name,
+                                         &error_message));
+  EXPECT_EQ(effective_backend, "TORCH");
+  EXPECT_EQ(resolved_name, "glm_moe_dsa_mtp");
+  EXPECT_TRUE(error_message.empty());
+}
+
 }  // namespace
 }  // namespace xllm

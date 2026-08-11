@@ -396,6 +396,16 @@ class TestDecodeAclGraphSpeculativeMetadata:
             max_model_len=8,
         )
 
+    def test_graph_key_separates_mtp_topk_state(self) -> None:
+        without_state = DecodeAclGraphRunner._graph_key(
+            4, False, None, None
+        )
+        with_state = DecodeAclGraphRunner._graph_key(
+            4, False, None, torch.zeros(4, 1, 8, dtype=torch.int32)
+        )
+
+        assert without_state != with_state
+
     @staticmethod
     def _metadata() -> SimpleNamespace:
         return SimpleNamespace(
@@ -759,3 +769,30 @@ class TestExecuteRouting:
         result = executor.execute(torch.zeros(1), torch.zeros(1), metadata)
         executor.inductor_runner.execute.assert_called_once()
         assert torch.equal(result, torch.ones(3))
+
+    @patch(
+        "xllm.python.model_executor.executor._create_attention_backend",
+    )
+    def test_execute_returns_mtp_topk_state(self, mock_create):
+        mock_create.return_value = StubAttentionBackend()
+        model = _FakeModel(num_layers=1)
+        executor = ModelExecutor(model, {}, max_seqs_per_batch=4)
+
+        kv = (torch.zeros(1), torch.zeros(1))
+        executor.bind_kv_caches([kv])
+        executor.eager_runner = MagicMock()
+        executor.eager_runner.execute.return_value = torch.ones(2, 3)
+        model.model.mtp_topk_state = torch.arange(32).reshape(4, 2, 4)
+
+        metadata = MagicMock(spec=AttentionMetadata)
+        input_state = torch.zeros(2, 2, 4)
+        hidden, topk_state = executor.execute(
+            torch.zeros(2),
+            torch.zeros(2),
+            metadata,
+            mtp_topk_state=input_state,
+        )
+
+        assert torch.equal(hidden, torch.ones(2, 3))
+        assert torch.equal(topk_state, model.model.mtp_topk_state[:2])
+        assert executor.eager_runner.execute.call_args.args[4] is input_state
