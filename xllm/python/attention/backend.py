@@ -118,6 +118,15 @@ class MlaIndexContext:
     ]
 
 
+@dataclass(frozen=True)
+class MlaPreprocessContext:
+    """Decode cache tensors consumed by fused MLA preprocessing."""
+
+    kv_cache: torch.Tensor
+    rope_cache: torch.Tensor
+    slot_mapping: torch.Tensor
+
+
 class AttentionBackend(ABC):
     @abstractmethod
     def bind_kv_caches(self, kv_caches: list[LayerCache]) -> None:
@@ -156,10 +165,11 @@ class AttentionBackend(ABC):
         self,
         q_latent: torch.Tensor,
         q_pe: torch.Tensor,
-        k_latent: torch.Tensor,
-        k_pe: torch.Tensor,
+        k_latent: torch.Tensor | None,
+        k_pe: torch.Tensor | None,
         layer: "Attention",
         topk: torch.Tensor | None = None,
+        cache_is_preprocessed: bool = False,
     ) -> torch.Tensor:
         """Absorbed-MLA attention over paged latent (nope) + rope caches.
 
@@ -171,6 +181,14 @@ class AttentionBackend(ABC):
         raise NotImplementedError(
             f"{type(self).__name__} does not support MLA"
         )
+
+    def mla_preprocess_context(
+        self,
+        layer: "Attention",
+    ) -> MlaPreprocessContext | None:
+        """Return decode cache tensors for a fused preprocessing region."""
+        del layer
+        return None
 
     def mla_index_context(self, layer: "Attention") -> MlaIndexContext:
         """Public hook for an optional LightningIndexer.

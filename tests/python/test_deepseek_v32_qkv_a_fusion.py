@@ -58,18 +58,6 @@ def _source_tensors() -> dict[str, torch.Tensor]:
     }
 
 
-def test_fused_qkv_a_switch_is_cached_at_module_import(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    cached = deepseek_v32._FUSED_QKV_A_PROJ_ENABLED
-    monkeypatch.setenv(
-        "XLLM_FUSED_QKV_A_PROJ",
-        "0" if cached else "1",
-    )
-
-    assert deepseek_v32._FUSED_QKV_A_PROJ_ENABLED is cached
-
-
 def test_load_fused_w8a8_a_concatenates_output_parameters() -> None:
     model = nn.Module()
     model.fused = deepseek_v32.W8A8StaticLinear(
@@ -127,7 +115,6 @@ def test_load_fused_w8a8_a_rejects_different_input_quantization() -> None:
 
 def test_project_qkv_a_uses_one_projection_and_splits_output() -> None:
     attention = nn.Module()
-    attention._fused_qkv_a_proj = True
     attention.q_lora_rank = 2
     attention.kv_lora_rank = 3
     attention.qk_rope_head_dim = 1
@@ -143,24 +130,3 @@ def test_project_qkv_a_uses_one_projection_and_splits_output() -> None:
     assert projection.call_count == 1
     torch.testing.assert_close(q_a, expected[:, 4:])
     torch.testing.assert_close(kv, expected[:, :4])
-
-
-def test_project_qkv_a_fallback_uses_separate_projections() -> None:
-    attention = nn.Module()
-    attention._fused_qkv_a_proj = False
-    expected_q = torch.arange(4, dtype=torch.bfloat16).reshape(2, 2)
-    expected_kv = torch.arange(8, dtype=torch.bfloat16).reshape(2, 4)
-    q_projection = _QuantizedProjection(expected_q)
-    kv_projection = _QuantizedProjection(expected_kv)
-    attention.q_a_proj = q_projection
-    attention.kv_a_proj_with_mqa = kv_projection
-
-    q_a, kv = deepseek_v32.DeepseekV3MLAAttention._project_qkv_a(
-        attention,
-        torch.empty(2, 4, dtype=torch.int8),
-    )
-
-    assert q_projection.call_count == 1
-    assert kv_projection.call_count == 1
-    assert q_a is expected_q
-    assert kv is expected_kv

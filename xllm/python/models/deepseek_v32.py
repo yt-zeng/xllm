@@ -28,7 +28,11 @@ from xllm.python import distributed, kernels
 
 if TYPE_CHECKING:
     from xllm_weight_loader import StateDict
-from xllm.python.attention.backend import MlaIndexContext
+from xllm.python.attention.backend import (
+    AttentionBackend,
+    MlaIndexContext,
+    MlaPreprocessContext,
+)
 from xllm.python.layers import (
     Attention,
     ColumnParallelLinear,
@@ -47,12 +51,6 @@ from xllm.python.models.base import PyModelBase, _dump_tensor_to_env_dir
 _SHARED_EXPERT_STREAMS: dict[
     tuple[str, int | None], torch.npu.Stream
 ] = {}
-_FUSED_QKV_A_PROJ_ENABLED = os.environ.get(
-    "XLLM_FUSED_QKV_A_PROJ",
-    "1",
-).strip().lower() not in ("0", "false", "off")
-
-
 def _shared_expert_stream(device: torch.device) -> torch.npu.Stream:
     """Return the process-wide shared-expert stream for one NPU device."""
     key = (device.type, device.index)
@@ -61,15 +59,6 @@ def _shared_expert_stream(device: torch.device) -> torch.npu.Stream:
         stream = torch.npu.Stream(device=device)
         _SHARED_EXPERT_STREAMS[key] = stream
     return stream
-
-
-def _moe_expert_overlap_enabled() -> bool:
-    """Return whether routed and shared experts may overlap on NPU streams."""
-    return os.environ.get("XLLM_ENABLE_MOE_EXPERT_OVERLAP", "1").lower() not in (
-        "0",
-        "false",
-        "off",
-    )
 
 
 def _tp_rank_from_device(device: object) -> int:
@@ -725,24 +714,16 @@ class DeepseekV3MLAAttention(Attention):
         self.kv_lora_rank = kv_lora
         self.num_heads_local = num_heads
         self.q_lora_rank = cfg.q_lora_rank
-        self._fused_qkv_a_proj = _FUSED_QKV_A_PROJ_ENABLED
+        self._use_fused_mla_decode = device.type in (
+            "npu",
+            "privateuseone",
+        )
 
-        if self._fused_qkv_a_proj:
-            self.qkv_a_proj = W8A8StaticLinear(
-                cfg.hidden_size,
-                cfg.q_lora_rank + kv_lora + qk_rope,
-                device,
-            )
-            self.q_a_proj = None
-            self.kv_a_proj_with_mqa = None
-        else:
-            self.qkv_a_proj = None
-            self.q_a_proj = W8A8StaticLinear(
-                cfg.hidden_size, cfg.q_lora_rank, device
-            )
-            self.kv_a_proj_with_mqa = W8A8StaticLinear(
-                cfg.hidden_size, kv_lora + qk_rope, device
-            )
+        self.qkv_a_proj = W8A8StaticLinear(
+            cfg.hidden_size,
+            cfg.q_lora_rank + kv_lora + qk_rope,
+            device,
+        )
         self.q_b_proj = W8A8StaticLinear(
             cfg.q_lora_rank, num_heads * (qk_nope + qk_rope), device
         )
@@ -780,14 +761,7 @@ class DeepseekV3MLAAttention(Attention):
         )
 
     def process_weights_after_loading(self) -> None:
-        if self._fused_qkv_a_proj:
-            assert self.qkv_a_proj is not None
-            self.qkv_a_proj.process_weights_after_loading()
-        else:
-            assert self.q_a_proj is not None
-            assert self.kv_a_proj_with_mqa is not None
-            self.q_a_proj.process_weights_after_loading()
-            self.kv_a_proj_with_mqa.process_weights_after_loading()
+        self.qkv_a_proj.process_weights_after_loading()
         self.q_b_proj.process_weights_after_loading()
         self.o_proj.process_weights_after_loading()
         w = self.kv_b_proj.weight.data
@@ -805,23 +779,83 @@ class DeepseekV3MLAAttention(Attention):
     def _project_qkv_a(
         self, input_norm_quant: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self._fused_qkv_a_proj:
-            assert self.qkv_a_proj is not None
-            qkv_a = self.qkv_a_proj.forward_quantized(input_norm_quant)
-            kv, q_a = qkv_a.split(
-                [
-                    self.kv_lora_rank + self.qk_rope_head_dim,
-                    self.q_lora_rank,
-                ],
-                dim=-1,
-            )
-            return q_a, kv
-        assert self.q_a_proj is not None
-        assert self.kv_a_proj_with_mqa is not None
-        return (
-            self.q_a_proj.forward_quantized(input_norm_quant),
-            self.kv_a_proj_with_mqa.forward_quantized(input_norm_quant),
+        qkv_a = self.qkv_a_proj.forward_quantized(input_norm_quant)
+        kv, q_a = qkv_a.split(
+            [
+                self.kv_lora_rank + self.qk_rope_head_dim,
+                self.q_lora_rank,
+            ],
+            dim=-1,
         )
+        return q_a, kv
+
+    def _forward_fused_mla_decode(
+        self,
+        hidden: torch.Tensor,
+        half_rope_cos: torch.Tensor,
+        half_rope_sin: torch.Tensor,
+        rope_cos: torch.Tensor,
+        rope_sin: torch.Tensor,
+        backend: AttentionBackend,
+        context: MlaPreprocessContext,
+    ) -> torch.Tensor:
+        q_c, q_latent, q_pe = kernels.deepseek_mla_preprocess_decode(
+            hidden,
+            self.qkv_a_proj.input_scale,
+            self.qkv_a_proj.input_offset,
+            self.qkv_a_proj.weight,
+            self.qkv_a_proj.deq_scale,
+            self.qkv_a_proj.quant_bias,
+            self.q_a_layernorm.weight,
+            self.q_b_proj.input_scale,
+            self.q_b_proj.input_offset,
+            self.q_b_proj.weight,
+            self.q_b_proj.deq_scale,
+            self.q_b_proj.quant_bias,
+            self.W_UK,
+            self.kv_a_layernorm.weight,
+            rope_cos,
+            rope_sin,
+            context.slot_mapping[: hidden.shape[0]],
+            context.kv_cache,
+            context.rope_cache,
+            self.kv_lora_rank,
+            self.q_lora_rank,
+            self.num_heads_local,
+            self.qk_nope_head_dim,
+            self.qk_rope_head_dim,
+            self.q_a_layernorm.eps,
+            self.kv_a_layernorm.eps,
+        )
+        topk = None
+        if self.indexer is not None:
+            index_context = backend.mla_index_context(self)
+            topk = self.indexer.select_qli(
+                hidden,
+                q_c,
+                index_context,
+                half_rope_cos,
+                half_rope_sin,
+            )
+        attn_out = backend.execute_mla(
+            q_latent,
+            q_pe,
+            None,
+            None,
+            self,
+            topk=topk,
+            cache_is_preprocessed=True,
+        )
+        v_full = _batch_matmul_transpose(
+            attn_out.transpose(0, 1), self.W_UV
+        )
+        v_full = v_full.reshape(
+            hidden.shape[0], self.num_heads_local * self.v_head_dim
+        )
+        output = self.o_proj(v_full)
+        if self.cfg.tp_size > 1:
+            distributed.all_reduce_(output)
+        return output
 
     def forward(
         self,
@@ -836,16 +870,23 @@ class DeepseekV3MLAAttention(Attention):
             self.layer_id == 0
             and bool(os.environ.get("XLLM_PYTHON_LAYER_DETAIL_DUMP_DIR"))
         )
-        input_proj = (
-            self.qkv_a_proj
-            if self._fused_qkv_a_proj
-            else self.q_a_proj
-        )
-        assert input_proj is not None
+        backend = get_forward_context().attention_backend
+        if self._use_fused_mla_decode and not dump_mla_details:
+            preprocess_context = backend.mla_preprocess_context(self)
+            if preprocess_context is not None:
+                return self._forward_fused_mla_decode(
+                    hidden,
+                    half_rope_cos,
+                    half_rope_sin,
+                    rope_cos,
+                    rope_sin,
+                    backend,
+                    preprocess_context,
+                )
         input_norm_quant = kernels.quantize_per_tensor(
             hidden,
-            input_proj.input_scale,
-            input_proj.input_offset,
+            self.qkv_a_proj.input_scale,
+            self.qkv_a_proj.input_offset,
             torch.qint8,
             -1,
         )
@@ -856,12 +897,12 @@ class DeepseekV3MLAAttention(Attention):
                 "layer_0_mla_input_norm_bf16.pt",
             )
             _dump_tensor_to_env_dir(
-                input_proj.input_scale,
+                self.qkv_a_proj.input_scale,
                 "XLLM_PYTHON_LAYER_DETAIL_DUMP_DIR",
                 "layer_0_mla_input_norm_quant_scale.pt",
             )
             _dump_tensor_to_env_dir(
-                input_proj.input_offset,
+                self.qkv_a_proj.input_offset,
                 "XLLM_PYTHON_LAYER_DETAIL_DUMP_DIR",
                 "layer_0_mla_input_norm_quant_offset.pt",
             )
@@ -906,7 +947,6 @@ class DeepseekV3MLAAttention(Attention):
                 "XLLM_PYTHON_LAYER_DETAIL_DUMP_DIR",
                 "layer_0_mla_q_a_norm_quant.pt",
             )
-        backend = get_forward_context().attention_backend
         topk = None
         if self.indexer is not None:
             ctx = backend.mla_index_context(self)
@@ -943,8 +983,12 @@ class DeepseekV3MLAAttention(Attention):
         k_pe = _interleave_rope_with(
             k_rope_raw.unsqueeze(1), rope_cos, rope_sin
         )
-        k_latent_3d = k_latent.view(num_tokens, 1, self.kv_lora_rank)
-        k_pe_3d = k_pe.view(num_tokens, 1, self.qk_rope_head_dim)
+        k_latent_3d = k_latent.view(
+            num_tokens, 1, self.kv_lora_rank
+        )
+        k_pe_3d = k_pe.view(
+            num_tokens, 1, self.qk_rope_head_dim
+        )
 
         attn_out = backend.execute_mla(
             q_latent, q_pe, k_latent_3d, k_pe_3d, self, topk=topk
@@ -1189,8 +1233,7 @@ class DeepseekV3MoE(nn.Module):
             skip_tp_reduce=True,
         )
         self._expert_parallel_enabled = (
-            _moe_expert_overlap_enabled()
-            and hasattr(torch, "npu")
+            hasattr(torch, "npu")
             and device.type in ("npu", "privateuseone")
         )
         self._shared_expert_start_event: torch.npu.Event | None = None
@@ -1488,16 +1531,11 @@ class DeepseekV3ForCausalLM(PyModelBase):
             loader.copy_in(p + "post_attention_layernorm.weight",
                            loader.load_tensor(p + "post_attention_layernorm.weight"))
             attn = p + "self_attn."
-            attention = self.model.layers[i].self_attn
-            if attention._fused_qkv_a_proj:
-                loader.load_fused_w8a8_a(
-                    attn,
-                    "qkv_a_proj",
-                    ("kv_a_proj_with_mqa", "q_a_proj"),
-                )
-            else:
-                loader.load_w8a8_a(attn, "q_a_proj")
-                loader.load_w8a8_a(attn, "kv_a_proj_with_mqa")
+            loader.load_fused_w8a8_a(
+                attn,
+                "qkv_a_proj",
+                ("kv_a_proj_with_mqa", "q_a_proj"),
+            )
             loader.copy_in(attn + "q_a_layernorm.weight",
                            loader.load_tensor(attn + "q_a_layernorm.weight"))
             loader.load_w8a8_a(attn, "q_b_proj",

@@ -53,6 +53,7 @@ from .linear import (
     prepare_quant_weight,
     prepare_row_parallel_weight,
 )
+from .mla import deepseek_mla_preprocess_decode
 from .moe import (
     cutlass_fused_moe,
     fused_moe,
@@ -107,6 +108,7 @@ __all__ = [
     "supports_cutlass_moe",
     "prepare_row_parallel_weight",
     "prepare_quant_weight",
+    "deepseek_mla_preprocess_decode",
     "quant_matmul",
     "quantize_per_tensor",
     "dynamic_quant",

@@ -31,6 +31,7 @@ from xllm.python.attention.backend import (
     AttentionMetadata,
     LayerCache,
     MlaIndexContext,
+    MlaPreprocessContext,
 )
 from xllm.python.attention.expanded_decode_metadata import (
     resolve_expanded_decode_metadata,
@@ -354,10 +355,11 @@ class NpuPagedAttentionBackend(AttentionBackend):
         self,
         q_latent: torch.Tensor,
         q_pe: torch.Tensor,
-        k_latent_3d: torch.Tensor,
-        k_pe_3d: torch.Tensor,
+        k_latent_3d: torch.Tensor | None,
+        k_pe_3d: torch.Tensor | None,
         layer: "Attention",
         topk: torch.Tensor | None = None,
+        cache_is_preprocessed: bool = False,
     ) -> torch.Tensor:
         """Absorbed-MLA attention. Returns [T, H, kv_lora]; caller bmm's W_UV."""
         metadata = self._metadata
@@ -376,9 +378,16 @@ class NpuPagedAttentionBackend(AttentionBackend):
         if self._block_table_i32 is None:
             raise RuntimeError("MLA requires a block table")
 
-        torch.ops.xllm_ops.reshape_paged_cache(
-            metadata.slot_mapping, k_latent_3d, k_pe_3d, nope_cache, rope_cache
-        )
+        if not cache_is_preprocessed:
+            if k_latent_3d is None or k_pe_3d is None:
+                raise RuntimeError("MLA cache inputs are required")
+            torch.ops.xllm_ops.reshape_paged_cache(
+                metadata.slot_mapping,
+                k_latent_3d,
+                k_pe_3d,
+                nope_cache,
+                rope_cache,
+            )
         return self._mla_sparse(
             q_latent,
             q_pe,
@@ -387,6 +396,29 @@ class NpuPagedAttentionBackend(AttentionBackend):
             topk,
             self._block_table_i32,
             layer_id,
+        )
+
+    def mla_preprocess_context(
+        self,
+        layer: "Attention",
+    ) -> MlaPreprocessContext | None:
+        metadata = self._metadata
+        if (
+            metadata is None
+            or metadata.is_prefill
+            or metadata.is_chunked_prefill
+        ):
+            return None
+        layer_cache = self._kv_caches[layer.layer_id]
+        kv_cache, rope_cache = layer_cache.key, layer_cache.value
+        if kv_cache is None or rope_cache is None:
+            raise RuntimeError(
+                f"MLA latent cache is missing for layer {layer.layer_id}"
+            )
+        return MlaPreprocessContext(
+            kv_cache=kv_cache,
+            rope_cache=rope_cache,
+            slot_mapping=metadata.slot_mapping,
         )
 
     def mla_index_context(self, layer: "Attention") -> MlaIndexContext:

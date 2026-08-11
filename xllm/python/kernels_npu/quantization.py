@@ -19,8 +19,6 @@ from __future__ import annotations
 import torch
 import torch_npu
 
-from .linear import WEIGHT_NZ_ENABLED
-
 
 def quant_matmul(
     x1: torch.Tensor,
@@ -47,7 +45,7 @@ def quant_matmul(
     Returns:
         The product with shape ``[..., N]`` in ``output_dtype``.
     """
-    if WEIGHT_NZ_ENABLED and not transpose2:
+    if not transpose2:
         return torch_npu.npu_quant_matmul(
             x1,
             x2,

@@ -43,48 +43,11 @@ def test_prepare_quant_weight_delegates_to_platform_helper(
     assert prepared is expected
 
 
-@pytest.mark.parametrize(
-    ("env_value", "expected"),
-    [
-        (None, True),
-        ("1", True),
-        (" TRUE ", True),
-        ("on", True),
-        ("0", False),
-        ("False", False),
-        (" off ", False),
-    ],
-)
-def test_weight_nz_switch_parser(
-    env_value: str | None,
-    expected: bool,
-) -> None:
-    assert linear_kernels._parse_weight_nz_enabled(env_value) is expected
-
-
-def test_weight_nz_switch_rejects_invalid_value() -> None:
-    with pytest.raises(ValueError, match="XLLM_W8A8_WEIGHT_NZ"):
-        linear_kernels._parse_weight_nz_enabled("enable")
-
-
-def test_weight_nz_switch_is_cached_at_module_import(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    cached = linear_kernels.WEIGHT_NZ_ENABLED
-    monkeypatch.setenv(
-        "XLLM_W8A8_WEIGHT_NZ",
-        "0" if cached else "1",
-    )
-
-    assert linear_kernels.WEIGHT_NZ_ENABLED is cached
-
-
 def test_quant_matmul_uses_npu_api_for_nz(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     expected = torch.empty(2, 4)
     npu_quant_matmul = MagicMock(return_value=expected)
-    monkeypatch.setattr(quantization, "WEIGHT_NZ_ENABLED", True)
     monkeypatch.setattr(
         quantization.torch_npu,
         "npu_quant_matmul",
@@ -128,14 +91,10 @@ def test_dynamic_w8a8_linear_rejects_nonzero_weight_offset() -> None:
 @pytest.mark.parametrize("dynamic_scale", [False, True])
 def test_npu_fractal_nz_quant_matmul_matches_nd(
     dynamic_scale: bool,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     torch_npu = pytest.importorskip("torch_npu")
     if not hasattr(torch, "npu") or not torch.npu.is_available():
         pytest.skip("NPU is required for FRACTAL_NZ accuracy validation")
-    monkeypatch.setattr(linear_kernels, "WEIGHT_NZ_ENABLED", True)
-    monkeypatch.setattr(quantization, "WEIGHT_NZ_ENABLED", True)
-
     device = torch.device("npu:0")
     num_tokens, in_features, out_features = 7, 64, 48
     activations = torch.randint(

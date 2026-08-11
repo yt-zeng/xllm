@@ -16,36 +16,10 @@
 
 from __future__ import annotations
 
-import os
-
 import torch
 import torch_npu
 
 _FRACTAL_NZ_FORMAT = 29
-_TRUE_ENV_VALUES = frozenset(("1", "true", "on"))
-_FALSE_ENV_VALUES = frozenset(("0", "false", "off"))
-
-
-def _parse_weight_nz_enabled(value: str | None) -> bool:
-    """Parse the process-level FRACTAL_NZ switch."""
-    if value is None:
-        return True
-    normalized = value.strip().lower()
-    if normalized in _TRUE_ENV_VALUES:
-        return True
-    if normalized in _FALSE_ENV_VALUES:
-        return False
-    raise ValueError(
-        "XLLM_W8A8_WEIGHT_NZ must be one of 1, true, on, 0, false, or off; "
-        f"got {value!r}"
-    )
-
-
-# Read once when the NPU kernel package is loaded. Set the variable before
-# process startup; changing the environment after import has no effect.
-WEIGHT_NZ_ENABLED = _parse_weight_nz_enabled(
-    os.environ.get("XLLM_W8A8_WEIGHT_NZ")
-)
 
 
 def prepare_row_parallel_weight(
@@ -83,7 +57,7 @@ def prepare_quant_weight(
     loading without an initialized NPU.
     """
     transposed = weight.transpose(0, 1).contiguous()
-    if weight.device.type == "cpu" or not WEIGHT_NZ_ENABLED:
+    if weight.device.type == "cpu":
         return transposed
     return torch_npu.npu_format_cast(transposed, _FRACTAL_NZ_FORMAT)
 
