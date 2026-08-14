@@ -25,6 +25,7 @@ limitations under the License.
 #include <utility>
 
 #include "core/framework/config/execution_config.h"
+#include "core/framework/config/kernel_config.h"
 #include "core/framework/model/model_output.h"
 #include "core/framework/model_loader.h"
 #include "core/framework/state_dict/state_dict.h"
@@ -210,6 +211,9 @@ py::dict PyCausalLM::build_config_dict(
   d["enable_graph"] = ExecutionConfig::get_instance().enable_graph();
   d["python_graph_backend"] =
       ExecutionConfig::get_instance().python_graph_backend();
+#if defined(USE_NPU)
+  d["enable_fused_mc2"] = KernelConfig::get_instance().enable_fused_mc2() > 0;
+#endif
   return d;
 }
 

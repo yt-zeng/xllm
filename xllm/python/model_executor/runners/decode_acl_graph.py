@@ -171,7 +171,12 @@ class DecodeAclGraphRunner(BaseRunner):
         block_table = block_table.to(torch.int32)
         kv_seq_lens = kv_seq_lens.to(torch.int32)
         is_mla = getattr(self.attention_backend, "is_mla", False)
-        if kv_seq_lens_host_values is None and not is_mla:
+        requires_host_kv_lengths = not is_mla or getattr(
+            self.attention_backend,
+            "requires_host_kv_lengths",
+            False,
+        )
+        if kv_seq_lens_host_values is None and requires_host_kv_lengths:
             raise RuntimeError("decode graph requires scheduler-provided host KV lengths")
 
         paged_kv_indptr = expanded.paged_kv_indptr if expanded is not None else metadata.paged_kv_indptr
@@ -420,10 +425,13 @@ class DecodeAclGraphRunner(BaseRunner):
         if first_capture:
             self._capture(entry)
 
+        # Besides ordering input updates, this wait protects the output view
+        # returned by the previous replay.  The graph cannot overwrite its
+        # static output until consumers queued on the current stream finish.
         self._stream.wait_stream(torch.npu.current_stream())
         with torch.npu.stream(self._stream):
             entry.graph.replay()
-            output = entry.static_output[:batch_size].clone()
+            output = entry.static_output[:batch_size]
 
         # A captured FIA task waits on its update event before execution.  This
         # lets replay run concurrently with the host-side updates for later
@@ -540,9 +548,14 @@ class DecodeAclGraphRunner(BaseRunner):
                 paged_attention_tiling_data=None,
                 kv_seq_lens_host=None,
                 kv_seq_lens_host_values=(
-                    None
-                    if getattr(self.attention_backend, "is_mla", False)
-                    else entry.static_metadata.kv_seq_lens_host_values
+                    entry.static_metadata.kv_seq_lens_host_values
+                    if getattr(
+                        self.attention_backend,
+                        "requires_host_kv_lengths",
+                        False,
+                    )
+                    or not getattr(self.attention_backend, "is_mla", False)
+                    else None
                 ),
             )
         return entry
@@ -639,7 +652,11 @@ class DecodeAclGraphRunner(BaseRunner):
         kv_seq_lens: list[int] | None,
         batch_size: int,
     ) -> None:
-        if getattr(self.attention_backend, "is_mla", False):
+        if getattr(self.attention_backend, "is_mla", False) and not getattr(
+            self.attention_backend,
+            "requires_host_kv_lengths",
+            False,
+        ):
             return
         if kv_seq_lens is None:
             raise RuntimeError("decode ACL graph requires scheduler-provided host KV lengths")

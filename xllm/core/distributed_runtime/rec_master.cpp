@@ -834,6 +834,7 @@ std::shared_ptr<Request> RecMaster::build_request_common(
     }
 
     std::vector<std::vector<int32_t>> stop_sequences;
+    std::vector<std::string> stop_strings;
     if (sp.stop.has_value()) {
       if (!tokenizer_) {
         CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
@@ -842,13 +843,16 @@ std::shared_ptr<Request> RecMaster::build_request_common(
       }
       for (const auto& s : sp.stop.value()) {
         std::vector<int> tmp_tokens;
-        if (!tokenizer_->encode(s, &tmp_tokens)) {
+        if (!tokenizer_->encode(s,
+                                &tmp_tokens,
+                                /*add_special_tokens=*/false)) {
           CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
                               "Failed to encode stop sequence");
           LOG(ERROR) << "Failed to encode stop sequence: " << s;
           return nullptr;
         }
         stop_sequences.push_back(std::move(tmp_tokens));
+        stop_strings.push_back(s);
       }
     }
 
@@ -858,7 +862,9 @@ std::shared_ptr<Request> RecMaster::build_request_common(
                         model_args_.eos_token_id(),
                         sp.ignore_eos,
                         std::move(stop_tokens),
-                        std::move(stop_sequences));
+                        std::move(stop_sequences),
+                        std::move(stop_strings));
+    stopping_checker.set_text_stop_tokenizer(tokenizer_.get());
   }
 
   RequestState req_state(std::move(prompt),

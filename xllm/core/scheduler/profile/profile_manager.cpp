@@ -57,6 +57,14 @@ ProfileManager::ProfileManager(Engine* engine, const Options& options)
     max_decode_batch_size =
         std::min(max_decode_batch_size, max_concurrent_requests);
   }
+#if defined(USE_NPU)
+  const int32_t graph_decode_batch_size_limit =
+      std::max<int32_t>(1,
+                        ::xllm::ExecutionConfig::get_instance()
+                            .acl_graph_decode_batch_size_limit());
+  max_decode_batch_size =
+      std::min(max_decode_batch_size, graph_decode_batch_size_limit);
+#endif
   decode_graph_warmup_plan_ =
       build_decode_graph_warmup_plan(engine_->decode_graph_execution_shape(),
                                      max_decode_batch_size,
@@ -85,9 +93,12 @@ ProfileManager::ProfileManager(Engine* engine, const Options& options)
   // prediction.
 
 #if defined(USE_NPU) || defined(USE_CUDA) || defined(USE_MLU)
-  // Warmup ACL graph executor if enabled
-  if (::xllm::ExecutionConfig::get_instance().enable_graph()) {
-    if (!is_rec_multi_round_mode()) {
+  const auto& execution_config = ::xllm::ExecutionConfig::get_instance();
+  if (execution_config.enable_graph()) {
+    if (execution_config.disable_graph_warmup()) {
+      LOG(INFO) << "Graph warmup disabled by execution config; graphs will be "
+                   "captured lazily from real requests";
+    } else if (!is_rec_multi_round_mode()) {
       warmup_for_graph();
     }
   }
@@ -931,7 +942,7 @@ double ProfileManager::run_request(int32_t token_length,
   sequences_budget.reserve(batch_size);
   requests.reserve(batch_size);
 
-  // batch sequences with the same kv cahce and token length
+  // batch sequences with the same kv cache and token length
   for (int32_t i = 0; i < batch_size; i++) {
     // generate random token ids and request
     std::shared_ptr<Request> request =
@@ -979,7 +990,7 @@ double ProfileManager::run_request(
   sequences_budget.reserve(token_length_vec.size());
   requests.reserve(token_length_vec.size());
 
-  // batch sequences with the same kv cahce and token length
+  // batch sequences with the same kv cache and token length
   for (int32_t i = 0; i < token_length_vec.size(); i++) {
     // generate random token ids and request
     int32_t token_length = token_length_vec[i];

@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import sys
 import types
+from contextlib import nullcontext
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -272,7 +274,10 @@ class TestModelExecutorConstruction:
         mock_create.return_value = StubAttentionBackend()
         model = _FakeModel(num_layers=1)
 
-        with pytest.raises(NotImplementedError, match="supports cudagraphs and aclgraph only"):
+        with pytest.raises(
+            NotImplementedError,
+            match="supports cudagraphs and aclgraph only",
+        ):
             ModelExecutor(
                 model,
                 {
@@ -560,6 +565,57 @@ class TestDecodeAclGraphSpeculativeMetadata:
                 slot_mapping,
                 sequence_count=4,
             )
+
+    def test_replay_returns_static_output_view(self) -> None:
+        runner = self._runner()
+        batch_size = 3
+        padded_batch_size = 4
+        static_output = torch.arange(12).reshape(padded_batch_size, 3)
+        graph = MagicMock()
+        entry = SimpleNamespace(
+            graph=graph,
+            static_output=static_output,
+            static_metadata=SimpleNamespace(),
+            graph_tasks=[],
+            execution_state=SimpleNamespace(persistent_buffers={}),
+        )
+        graph_key = runner._graph_key(
+            padded_batch_size,
+            is_expanded=False,
+            input_embedding=None,
+        )
+        runner._graphs[graph_key] = entry
+
+        replay_stream = MagicMock()
+        update_stream = MagicMock()
+        replay_done_event = MagicMock()
+        current_stream = MagicMock()
+        runner._stream = replay_stream
+        runner._update_stream = update_stream
+        runner._replay_done_event = replay_done_event
+        fake_npu = SimpleNamespace(
+            current_stream=MagicMock(return_value=current_stream),
+            stream=MagicMock(return_value=nullcontext()),
+        )
+        metadata = SimpleNamespace(expanded_decode_metadata=None)
+
+        with (
+            patch.object(torch, "npu", fake_npu, create=True),
+            patch.object(runner, "_fill_entry"),
+        ):
+            output = runner.execute(
+                torch.arange(batch_size, dtype=torch.int32),
+                torch.arange(batch_size, dtype=torch.int32),
+                metadata,
+            )
+
+        assert output.shape == (batch_size, 3)
+        assert output.data_ptr() == static_output.data_ptr()
+        output[0, 0] = -1
+        assert static_output[0, 0].item() == -1
+        replay_stream.wait_stream.assert_called_once_with(current_stream)
+        current_stream.wait_stream.assert_called_once_with(replay_stream)
+        graph.replay.assert_called_once_with()
 
 
 # ---------------------------------------------------------------------------

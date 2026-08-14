@@ -982,9 +982,6 @@ int64_t NpuDeepseekV32DecoderLayerImpl::init_layer() {
 int64_t NpuDeepseekV32DecoderLayerImpl::init_node(
     atb_speed::Model::Node& node,
     atb_speed::deepseekV2::DecoderLayerParam& param) {
-  bool eplb_enabled = ::xllm::EPLBConfig::get_instance().enable_eplb() &&
-                      layer_id_ >= decode_param_.firstKDenseReplace &&
-                      !decode_param_.isPrefill;
   atb::Operation* operation = nullptr;
   atb_speed::deepseekV2::DecoderLayer(param, &operation);
   node.operation.reset(operation);
@@ -998,16 +995,8 @@ int64_t NpuDeepseekV32DecoderLayerImpl::init_node(
   }
   node.inTensors.resize(node.operation->GetInputNum());
 
-  size_t out_tensor_num = 1;
-  if (eplb_enabled) {
-    ++out_tensor_num;
-  }
-  if (param.outputTopk) {
-    ++out_tensor_num;
-  }
+  const size_t out_tensor_num = node.operation->GetOutputNum();
   node.outTensors.resize(out_tensor_num);
-
-  size_t inTensorId = 1;
 
   for (size_t weightTensorId = 0; weightTensorId < WEIGHT_COUNT_PER_LAYER;
        ++weightTensorId) {

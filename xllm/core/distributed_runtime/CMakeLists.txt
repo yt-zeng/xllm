@@ -54,6 +54,7 @@ cc_library(
     shm_channel.cpp
   DEPS
     :api_service
+    :request
     :runtime
     :util
     glog::glog

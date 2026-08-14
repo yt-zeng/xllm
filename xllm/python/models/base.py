@@ -24,7 +24,7 @@ PyCausalLM no longer calls model.forward() directly.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import torch.nn as nn
@@ -58,7 +58,8 @@ class PyModelBase(nn.Module):
     def compute_logits(self, hidden: torch.Tensor, selected_idxes: torch.Tensor | None) -> torch.Tensor:
         if selected_idxes is not None and selected_idxes.numel() > 0:
             hidden = hidden.index_select(0, selected_idxes)
-        return self.lm_head(hidden)
+        logits = self.lm_head(hidden)
+        return logits
 
     # -- weight loading -------------------------------------------------------
     def load_weights(
