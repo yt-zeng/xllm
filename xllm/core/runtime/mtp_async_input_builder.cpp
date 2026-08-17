@@ -246,15 +246,28 @@ void prepare_target_verify_from_accepted_state(
   validate_input.positions =
       position_rows.flatten().to(validate_input.positions.options());
   if (validate_input.input_params.multi_block_tables.empty()) {
-    const torch::Tensor& expanded_block_tables =
+    const torch::Tensor& block_tables =
         validate_input.input_params.attention.device.block_tables;
-    CHECK(expanded_block_tables.defined());
-    CHECK_EQ(expanded_block_tables.dim(), 2);
-    CHECK_EQ(expanded_block_tables.size(0), batch_size * validate_width);
-    torch::Tensor sequence_block_tables =
-        expanded_block_tables
-            .view({batch_size, validate_width, expanded_block_tables.size(1)})
-            .select(/*dim=*/1, /*index=*/0);
+    CHECK(block_tables.defined());
+    CHECK_EQ(block_tables.dim(), 2);
+    const int64_t block_table_rows = block_tables.size(0);
+    const int64_t token_level_rows = batch_size * validate_width;
+    CHECK(block_table_rows == batch_size ||
+          block_table_rows == token_level_rows)
+        << "Target verify block tables must be sequence-level or token-level, "
+        << "rows=" << block_table_rows << ", batch_size=" << batch_size
+        << ", validate_width=" << validate_width;
+    torch::Tensor sequence_block_tables;
+    if (block_table_rows == batch_size) {
+      // Explicit spec-verify graph inputs keep the scheduler's sequence-level
+      // table here and store tokenwise rows separately in GraphInput.
+      sequence_block_tables = block_tables;
+    } else {
+      // Preserve the legacy expanded layout used by eager/non-explicit paths.
+      sequence_block_tables =
+          block_tables.view({batch_size, validate_width, block_tables.size(1)})
+              .select(/*dim=*/1, /*index=*/0);
+    }
     validate_input.input_params.attention.device.new_cache_slots =
         map_positions_to_cache_slots(
             sequence_block_tables, position_rows, block_size);
@@ -265,17 +278,35 @@ void prepare_target_verify_from_accepted_state(
             .flatten();
   }
 
+  torch::Tensor& sequence_kv_seq_lens =
+      validate_input.input_params.attention.device.kv_seq_lens;
+  CHECK(sequence_kv_seq_lens.defined());
+  const int64_t token_level_count = batch_size * validate_width;
+  const bool has_sequence_level_kv = sequence_kv_seq_lens.numel() == batch_size;
+  torch::Tensor* token_level_kv_seq_lens = &sequence_kv_seq_lens;
+  if (has_sequence_level_kv) {
+    auto& graph = validate_input.input_params.graph;
+    CHECK(graph.use_expanded_decode_for_spec_verify_attention);
+    CHECK(graph.expanded_kv_seq_lens.defined());
+    CHECK_EQ(graph.expanded_kv_seq_lens.numel(), token_level_count);
+    token_level_kv_seq_lens = &graph.expanded_kv_seq_lens;
+  } else {
+    CHECK_EQ(sequence_kv_seq_lens.numel(), token_level_count);
+  }
+
   torch::Tensor template_kv_rows =
-      validate_input.input_params.attention.device.kv_seq_lens.view(
-          {batch_size, validate_width});
+      token_level_kv_seq_lens->view({batch_size, validate_width});
   torch::Tensor kv_delta =
       metadata.base_kv_seq_lens -
       template_kv_rows.select(/*dim=*/1, /*index=*/0).to(torch::kLong);
-  validate_input.input_params.attention.device.kv_seq_lens =
-      (template_kv_rows.to(torch::kLong) + kv_delta.unsqueeze(1))
-          .flatten()
-          .to(validate_input.input_params.attention.device.kv_seq_lens
-                  .options());
+  torch::Tensor corrected_token_level_kv_seq_lens =
+      (template_kv_rows.to(torch::kLong) + kv_delta.unsqueeze(1)).flatten();
+  *token_level_kv_seq_lens =
+      corrected_token_level_kv_seq_lens.to(token_level_kv_seq_lens->options());
+  if (has_sequence_level_kv) {
+    sequence_kv_seq_lens = (sequence_kv_seq_lens.to(torch::kLong) + kv_delta)
+                               .to(sequence_kv_seq_lens.options());
+  }
 
   torch::Tensor token_rows =
       validate_input.token_ids.view({batch_size, validate_width});

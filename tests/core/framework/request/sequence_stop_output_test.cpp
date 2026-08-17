@@ -56,13 +56,16 @@ class SequenceStopOutputTest : public ::testing::Test {
                   bool include_stop_str_in_output = false,
                   int32_t eos_token = -1,
                   bool skip_special_tokens = false,
-                  bool logprobs = false) {
+                  bool logprobs = false,
+                  const std::vector<std::string>& stop_strings = {}) {
     stopping_checker_ = StoppingChecker(max_generated_tokens,
                                         /*max_context_len=*/0,
                                         eos_token,
                                         /*ignore_eos=*/false,
                                         stop_tokens,
-                                        stop_sequences);
+                                        stop_sequences,
+                                        stop_strings);
+    stopping_checker_.set_text_stop_tokenizer(&tokenizer_);
 
     SequenceParams params;
     params.seq_capacity = 16;
@@ -147,6 +150,57 @@ TEST_F(SequenceStopOutputTest, StreamingDoesNotEmitStopTokenDelta) {
   EXPECT_TRUE(stop_output->text.empty());
   ASSERT_EQ(stop_output->token_ids.size(), 1);
   EXPECT_EQ(stop_output->token_ids[0], StopAwareTokenizer::kStopTokenId);
+}
+
+TEST_F(SequenceStopOutputTest, TextStopMatchesDecodedSuffix) {
+  // The token representation intentionally differs from the stop string's
+  // standalone encoding. This simulates a BPE boundary-dependent stop.
+  initialize(/*max_generated_tokens=*/8,
+             /*stop_tokens=*/{},
+             /*stop_sequences=*/{{999}},
+             /*prompt_tokens=*/{'P'},
+             /*include_stop_str_in_output=*/false,
+             /*eos_token=*/-1,
+             /*skip_special_tokens=*/false,
+             /*logprobs=*/false,
+             /*stop_strings=*/{"<|observation|>"});
+  append_token('A');
+  EXPECT_FALSE(sequence_->finished());
+  append_token(StopAwareTokenizer::kStopTokenId);
+  ASSERT_TRUE(sequence_->finished());
+
+  SequenceOutput output = sequence_->generate_output(tokenizer_);
+  EXPECT_EQ(output.text, "A");
+  ASSERT_TRUE(output.finish_reason.has_value());
+  EXPECT_EQ(output.finish_reason.value(), "stop");
+}
+
+TEST_F(SequenceStopOutputTest, StreamingBuffersTextStopPrefix) {
+  initialize(/*max_generated_tokens=*/8,
+             /*stop_tokens=*/{},
+             /*stop_sequences=*/{{999}},
+             /*prompt_tokens=*/{'P'},
+             /*include_stop_str_in_output=*/false,
+             /*eos_token=*/-1,
+             /*skip_special_tokens=*/false,
+             /*logprobs=*/false,
+             /*stop_strings=*/{"<S>"});
+  append_token('A');
+  append_token('<');
+  append_token('S');
+  EXPECT_FALSE(sequence_->finished());
+
+  auto prefix_output =
+      sequence_->generate_streaming_output(sequence_->num_tokens(), tokenizer_);
+  ASSERT_TRUE(prefix_output.has_value());
+  EXPECT_EQ(prefix_output->text, "A");
+
+  append_token('>');
+  ASSERT_TRUE(sequence_->finished());
+  auto stop_output =
+      sequence_->generate_streaming_output(sequence_->num_tokens(), tokenizer_);
+  ASSERT_TRUE(stop_output.has_value());
+  EXPECT_TRUE(stop_output->text.empty());
 }
 
 TEST_F(SequenceStopOutputTest, NonStreamingIncludesStopTokenWhenRequested) {

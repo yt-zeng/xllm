@@ -71,6 +71,9 @@ CombinedDraftExecutionPath classify_combined_draft_execution_path(
   if (model_type == "glm_moe_dsa_mtp") {
     return CombinedDraftExecutionPath::GLM_MOE_DSA_SPARSE_ATTENTION;
   }
+  if (model_type == "deepseek_v32_mtp") {
+    return CombinedDraftExecutionPath::DEEPSEEK_V32_DSA_SPARSE_ATTENTION;
+  }
   return CombinedDraftExecutionPath::UNSUPPORTED;
 }
 
@@ -83,10 +86,19 @@ bool supports_combined_draft_configuration(
       return npu_backend == "TORCH" && dp_size <= 1;
     case CombinedDraftExecutionPath::GLM_MOE_DSA_SPARSE_ATTENTION:
       return npu_backend == "ATB";
+    case CombinedDraftExecutionPath::DEEPSEEK_V32_DSA_SPARSE_ATTENTION:
+      return npu_backend == "TORCH" && dp_size <= 1;
     case CombinedDraftExecutionPath::UNSUPPORTED:
       return false;
   }
   return false;
+}
+
+bool uses_continuous_dsa_drafts(CombinedDraftExecutionPath execution_path) {
+  return execution_path ==
+             CombinedDraftExecutionPath::GLM_MOE_DSA_SPARSE_ATTENTION ||
+         execution_path ==
+             CombinedDraftExecutionPath::DEEPSEEK_V32_DSA_SPARSE_ATTENTION;
 }
 
 torch::Tensor materialize_speculative_verify_tokens(

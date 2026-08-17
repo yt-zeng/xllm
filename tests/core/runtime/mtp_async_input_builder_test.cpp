@@ -139,6 +139,67 @@ TEST(MtpAsyncInputBuilderTest, CanSkipExpandedMetadataRebuild) {
   EXPECT_FALSE(draft_input.input_params.graph.expanded_kv_seq_lens.defined());
 }
 
+TEST(MtpAsyncInputBuilderTest, TargetVerifyAcceptsSequenceLevelBlockTables) {
+  ForwardInput validate_input;
+  validate_input.token_ids = torch::zeros({4}, torch::kInt);
+  validate_input.positions = torch::tensor({5, 6, 9, 10}, torch::kInt);
+  validate_input.input_params.attention.device.block_tables =
+      torch::tensor({{10, 11, 12}, {20, 21, 22}}, torch::kInt);
+  validate_input.input_params.attention.device.kv_seq_lens =
+      torch::tensor({7, 11}, torch::kInt);
+  validate_input.input_params.graph
+      .use_expanded_decode_for_spec_verify_attention = true;
+  validate_input.input_params.graph.expanded_kv_seq_lens =
+      torch::tensor({6, 7, 10, 11}, torch::kInt);
+  validate_input.input_params.graph.expanded_block_tables = torch::tensor(
+      {{10, 11, 12}, {10, 11, 12}, {20, 21, 22}, {20, 21, 22}}, torch::kInt);
+
+  prepare_target_verify_from_accepted_state(
+      validate_input,
+      torch::tensor({{42, -1}, {84, -1}}, torch::kLong),
+      torch::tensor({5, 9}, torch::kInt),
+      torch::tensor({6, 10}, torch::kInt),
+      kBlockSize);
+
+  EXPECT_TRUE(
+      torch::equal(validate_input.input_params.attention.device.new_cache_slots,
+                   torch::tensor({46, 47, 90, 91}, torch::kInt)));
+  EXPECT_TRUE(torch::equal(validate_input.positions,
+                           torch::tensor({6, 7, 10, 11}, torch::kInt)));
+  EXPECT_TRUE(
+      torch::equal(validate_input.input_params.attention.device.kv_seq_lens,
+                   torch::tensor({8, 12}, torch::kInt)));
+  EXPECT_TRUE(
+      torch::equal(validate_input.input_params.graph.expanded_kv_seq_lens,
+                   torch::tensor({7, 8, 11, 12}, torch::kInt)));
+  EXPECT_EQ(validate_input.token_ids[0].item<int32_t>(), 42);
+  EXPECT_EQ(validate_input.token_ids[2].item<int32_t>(), 84);
+}
+
+TEST(MtpAsyncInputBuilderTest, TargetVerifyAcceptsLegacyTokenLevelBlockTables) {
+  ForwardInput validate_input;
+  validate_input.token_ids = torch::zeros({2}, torch::kInt);
+  validate_input.positions = torch::tensor({5, 6}, torch::kInt);
+  validate_input.input_params.attention.device.block_tables =
+      torch::tensor({{10, 11}, {10, 11}}, torch::kInt);
+  validate_input.input_params.attention.device.kv_seq_lens =
+      torch::tensor({6, 7}, torch::kInt);
+
+  prepare_target_verify_from_accepted_state(
+      validate_input,
+      torch::tensor({{42, -1}}, torch::kLong),
+      torch::tensor({5}, torch::kInt),
+      torch::tensor({6}, torch::kInt),
+      kBlockSize);
+
+  EXPECT_TRUE(
+      torch::equal(validate_input.input_params.attention.device.new_cache_slots,
+                   torch::tensor({46, 47}, torch::kInt)));
+  EXPECT_TRUE(
+      torch::equal(validate_input.input_params.attention.device.kv_seq_lens,
+                   torch::tensor({7, 8}, torch::kInt)));
+}
+
 TEST(MtpAsyncInputBuilderTest, BuildsTokenwiseSpecVerifyKvLengths) {
   EXPECT_EQ(layer::ExpandedDecodeMetadataBuilder::build_tokenwise_kv_seq_lens(
                 /*q_seq_lens=*/{2, 1}, /*kv_seq_lens=*/{4, 3}),

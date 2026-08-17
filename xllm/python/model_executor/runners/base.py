@@ -50,5 +50,7 @@ class BaseRunner(ABC):
         metadata: AttentionMetadata,
         input_embedding: torch.Tensor | None = None,
         layer_synchronizer: LayerSynchronizer | None = None,
-    ) -> torch.Tensor:
+        mtp_topk_indices: torch.Tensor | None = None,
+        enable_mtp_topk_reuse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
         pass

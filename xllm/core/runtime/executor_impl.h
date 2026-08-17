@@ -19,6 +19,8 @@ limitations under the License.
 
 #include <cstdint>
 #include <memory>
+#include <optional>
+#include <vector>
 
 #include "common/macros.h"
 #include "framework/batch/batch.h"

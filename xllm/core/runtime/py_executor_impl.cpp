@@ -20,13 +20,11 @@ limitations under the License.
 #include <pybind11/embed.h>
 #include <torch/extension.h>
 
-#include <algorithm>
 #include <memory>
 #include <optional>
 #include <vector>
 
 #include "common/metrics.h"
-#include "core/framework/config/execution_config.h"
 #include "core/layers/common/attention_metadata.h"
 #include "core/layers/common/attention_metadata_builder.h"
 #include "core/runtime/py_attention_metadata.h"
@@ -35,6 +33,7 @@ limitations under the License.
 #if defined(USE_NPU)
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 
+#include "models/llm/npu/mtp_topk_state.h"
 #include "platform/npu/npu_layer_synchronizer.h"
 #endif
 
@@ -91,18 +90,10 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
   py::module_::import("xllm_runtime");
   py::module_ executor_module =
       py::module_::import("xllm.python.model_executor.executor");
-  int32_t graph_max_seqs_per_batch = options_.max_seqs_per_batch();
-#if defined(USE_NPU)
-  graph_max_seqs_per_batch = std::min(
-      graph_max_seqs_per_batch,
-      std::max<int32_t>(
-          1,
-          ExecutionConfig::get_instance().acl_graph_decode_batch_size_limit()));
-#endif
   py_executor_ =
       executor_module.attr("ModelExecutor")(py_causal_lm_->python_model(),
                                             py_causal_lm_->config_dict(),
-                                            graph_max_seqs_per_batch);
+                                            options_.max_seqs_per_batch());
 }
 
 PyExecutorImpl::~PyExecutorImpl() { clear_python_object(py_executor_); }
@@ -110,6 +101,34 @@ PyExecutorImpl::~PyExecutorImpl() { clear_python_object(py_executor_); }
 ForwardInput PyExecutorImpl::prepare_inputs(Batch& batch) {
   return batch.prepare_forward_input(
       options_.num_decoding_tokens(), 0, args_, options_.cp_size());
+}
+
+void PyExecutorImpl::bind_kv_caches(std::vector<KVCache>& kv_caches) {
+  int64_t num_layers = static_cast<int64_t>(kv_caches.size());
+  if (kv_bound_) {
+    CHECK_EQ(num_layers, kv_layer_count_)
+        << "KV cache layer count changed after initial bind";
+    return;
+  }
+
+  py::list kv_caches_py;
+  for (KVCache& kv : kv_caches) {
+    // Slot order must match ``LayerCache`` on the Python side.
+    const std::optional<torch::Tensor> indexer_cache_scale =
+        kv.get_indexer_cache_scale();
+    py::object indexer_cache_scale_py =
+        indexer_cache_scale.has_value() ? py::cast(indexer_cache_scale.value())
+                                        : py::none();
+    kv_caches_py.append(py::make_tuple(optional_tensor(kv.get_k_cache()),
+                                       optional_tensor(kv.get_v_cache()),
+                                       optional_tensor(kv.get_index_cache()),
+                                       optional_tensor(kv.get_conv_cache()),
+                                       optional_tensor(kv.get_ssm_cache()),
+                                       indexer_cache_scale_py));
+  }
+  py_executor_.attr("bind_kv_caches")(kv_caches_py);
+  kv_bound_ = true;
+  kv_layer_count_ = num_layers;
 }
 
 ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
@@ -131,37 +150,24 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
   py::gil_scoped_acquire gil;
 
   // Lazy bind KV caches on first call.
-  int64_t num_layers = static_cast<int64_t>(kv_caches.size());
-  if (!kv_bound_) {
-    py::list kv_caches_py;
-    for (auto& kv : kv_caches) {
-      // Slot order must match ``LayerCache`` on the Python side.
-      const std::optional<torch::Tensor> indexer_cache_scale =
-          kv.get_indexer_cache_scale();
-      py::object indexer_cache_scale_py =
-          indexer_cache_scale.has_value()
-              ? py::cast(indexer_cache_scale.value())
-              : py::none();
-      kv_caches_py.append(py::make_tuple(optional_tensor(kv.get_k_cache()),
-                                         optional_tensor(kv.get_v_cache()),
-                                         optional_tensor(kv.get_index_cache()),
-                                         optional_tensor(kv.get_conv_cache()),
-                                         optional_tensor(kv.get_ssm_cache()),
-                                         indexer_cache_scale_py));
-    }
-    py_executor_.attr("bind_kv_caches")(kv_caches_py);
-    kv_bound_ = true;
-    kv_layer_count_ = num_layers;
-  } else {
-    CHECK_EQ(num_layers, kv_layer_count_)
-        << "KV cache layer count changed after initial bind";
-  }
+  bind_kv_caches(kv_caches);
 
   py::object py_metadata =
       py::cast(PyAttentionMetadataView(attn_metadata, params));
   py::object input_embedding = params.embedding.input_embedding.defined()
                                    ? py::cast(params.embedding.input_embedding)
                                    : py::none();
+  py::object mtp_topk_indices = py::none();
+#if defined(USE_NPU)
+  if (params.mtp_topk_state != nullptr) {
+    const auto state =
+        std::dynamic_pointer_cast<const npu::model::NpuMtpTopkState>(
+            params.mtp_topk_state);
+    CHECK(state != nullptr)
+        << "Python MTP executor received an incompatible DSA top-k state.";
+    mtp_topk_indices = py::cast(state->topk_indices());
+  }
+#endif
 
   // --- VLM: vision encode + embedding merge on image/video prefill steps ---
   // On steps carrying multimodal input, ``params.multimodal.mm_data`` holds the
@@ -245,9 +251,30 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
   // get_input_embeddings above), so the runner takes the 2-arg model() branch
   // and Qwen3VLModel.forward reads _inputs_embeds. positions_arg carries the
   // mRoPE [3,N]->1-D decode collapse.
-  py::object hidden_obj = py_executor_.attr("execute")(
-      tokens, positions_arg, py_metadata, input_embedding, py_sync);
-  return ModelOutput(hidden_obj.cast<torch::Tensor>());
+  py::object result_obj = py_executor_.attr("execute")(tokens,
+                                                       positions_arg,
+                                                       py_metadata,
+                                                       input_embedding,
+                                                       py_sync,
+                                                       mtp_topk_indices);
+  if (!py::isinstance<py::tuple>(result_obj)) {
+    return ModelOutput(result_obj.cast<torch::Tensor>());
+  }
+
+  py::tuple result = result_obj.cast<py::tuple>();
+  CHECK_EQ(result.size(), 2)
+      << "Python MTP executor must return (hidden_states, topk_indices).";
+  ModelOutput output(result[0].cast<torch::Tensor>());
+#if defined(USE_NPU)
+  if (!result[1].is_none()) {
+    output.mtp_topk_state = std::make_shared<npu::model::NpuMtpTopkState>(
+        result[1].cast<torch::Tensor>());
+  }
+#else
+  CHECK(result[1].is_none())
+      << "Python MTP top-k reuse requires an NPU runtime.";
+#endif
+  return output;
 }
 
 }  // namespace xllm

@@ -75,6 +75,11 @@ class ForwardContext:
     # (cp_size <= 1) or the step is decode (CP is prefill-only in v1). Typed as
     # object to avoid a circular import with model_executor.cp_utils.CpContext.
     cp_context: object | None = None
+    # DSA MTP carries sparse top-k indices between speculative draft steps.
+    # The mutable output holder lets the first draft step publish its indices
+    # without making the model depend on the C++ speculative scheduler.
+    mtp_topk_indices: torch.Tensor | None = None
+    mtp_topk_output: list[torch.Tensor | None] | None = None
 
 
 _current_context: ContextVar[ForwardContext | None] = ContextVar("_current_context", default=None)

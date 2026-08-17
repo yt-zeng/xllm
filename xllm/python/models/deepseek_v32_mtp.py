@@ -28,6 +28,7 @@ import torch
 import torch.nn as nn
 
 from xllm.python.layers import ColumnParallelLinear, RMSNorm
+from xllm.python.model_executor.forward_context import get_forward_context
 from xllm.python.models.deepseek_v32 import (
     DeepseekV3Config,
     DeepseekV3DecoderLayer,
@@ -85,7 +86,7 @@ class DeepseekV32MtpModel(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         input_embedding: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
         assert self.embed_tokens is not None
         token_hidden = self.embed_tokens(input_ids)
         if input_embedding is None:
@@ -110,7 +111,10 @@ class DeepseekV32MtpModel(nn.Module):
                 rope_sin,
             )
         h, _ = self.norm(h, residual)
-        return h
+        topk_output = get_forward_context().mtp_topk_output
+        if topk_output is None:
+            return h
+        return h, topk_output[0]
 
 
 class _MtpStateDictView:

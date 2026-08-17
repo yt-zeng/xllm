@@ -20,6 +20,7 @@ validation, and execution routing — using CPU mocks so no GPU/NPU required.
 
 from __future__ import annotations
 
+import os
 import sys
 import types
 from contextlib import nullcontext
@@ -42,15 +43,20 @@ from xllm.python.layers.attention import Attention  # noqa: E402
 from xllm.python.model_executor.executor import (  # noqa: E402
     ModelExecutor,
     _create_attention_backend,
+    _parse_mtp_aclgraph_capture_sizes,
     _resolve_graph_backend,
+    _resolve_graph_max_model_len,
 )
 from xllm.python.model_executor.runners.decode_acl_graph import (  # noqa: E402
     DecodeAclGraphRunner,
+    _get_shared_graph_pool,
+    _slice_graph_output,
 )
 from xllm.python.model_executor.runners.decode_cuda_graph import (  # noqa: E402
     DecodeCudaGraphRunner,
     _decode_graph_buckets,
 )
+from xllm.python.model_executor.runners.eager import EagerRunner  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -153,6 +159,23 @@ class TestNpuGraphBackendResolution:
     def test_enable_graph_selects_aclgraph_on_npu(self, _mock_is_npu):
         config = {"enable_graph": True, "python_graph_backend": "off"}
         assert _resolve_graph_backend(config) == "aclgraph"
+
+    def test_mtp_capture_sizes_are_validated_and_deduplicated(self):
+        assert _parse_mtp_aclgraph_capture_sizes("1, 8,8,32") == frozenset((1, 8, 32))
+        with pytest.raises(ValueError, match="MTP_ACLGRAPH_CAPTURE_SIZES"):
+            _parse_mtp_aclgraph_capture_sizes("12")
+
+    def test_graph_max_model_len_can_be_capped_without_expanding_model_limit(self):
+        config = {"max_position_embeddings": 163840}
+        with patch.dict(os.environ, {"XLLM_ACLGRAPH_MAX_MODEL_LEN": "8192"}):
+            assert _resolve_graph_max_model_len(config) == 8192
+        with patch.dict(os.environ, {"XLLM_ACLGRAPH_MAX_MODEL_LEN": "262144"}):
+            assert _resolve_graph_max_model_len(config) == 163840
+        with (
+            patch.dict(os.environ, {"XLLM_ACLGRAPH_MAX_MODEL_LEN": "0"}),
+            pytest.raises(ValueError, match="must be positive"),
+        ):
+            _resolve_graph_max_model_len(config)
 
 
 # ---------------------------------------------------------------------------
@@ -372,14 +395,51 @@ class TestDecodeCudaGraphDataParallelKeys:
 
 class TestDecodeAclGraphSpeculativeMetadata:
     @staticmethod
-    def _runner() -> DecodeAclGraphRunner:
+    def _runner(
+        mtp_graph_capture_sizes: frozenset[int] | None = None,
+        allow_mtp_topk_reuse_graph: bool = False,
+    ) -> DecodeAclGraphRunner:
         return DecodeAclGraphRunner(
             nn.Identity(),
             _PagedStubAttentionBackend(),
             torch.device("cpu"),
             max_batch=4,
             max_model_len=8,
+            mtp_graph_capture_sizes=mtp_graph_capture_sizes,
+            allow_mtp_topk_reuse_graph=allow_mtp_topk_reuse_graph,
         )
+
+    def test_mtp_topk_graph_input_has_an_independent_static_shape(self) -> None:
+        runner = self._runner(allow_mtp_topk_reuse_graph=True)
+        topk = torch.arange(12, dtype=torch.int32).reshape(3, 2, 2)
+
+        assert runner._graph_key(4, False, None, True, None) != runner._graph_key(4, False, None, True, topk)
+        static_topk = torch.full((4, 2, 2), -1, dtype=torch.int32)
+        entry = SimpleNamespace(static_mtp_topk_indices=static_topk)
+        DecodeAclGraphRunner._fill_mtp_topk_indices(entry, topk, 3)
+
+        assert torch.equal(static_topk[:3], topk)
+        assert torch.count_nonzero(static_topk[3]).item() == 0
+
+    def test_mtp_tuple_output_and_graph_pool_keep_static_storage(self) -> None:
+        hidden = torch.arange(12).reshape(4, 3)
+        topk = torch.arange(16, dtype=torch.int32).reshape(4, 2, 2)
+        output = _slice_graph_output((hidden, topk), batch_size=3)
+
+        assert output[0].data_ptr() == hidden.data_ptr()
+        assert output[1].data_ptr() == topk.data_ptr()
+        pool = object()
+        fake_npu = SimpleNamespace(graph_pool_handle=MagicMock(return_value=pool))
+        with (
+            patch.object(torch, "npu", fake_npu, create=True),
+            patch(
+                "xllm.python.model_executor.runners.decode_acl_graph._SHARED_GRAPH_POOL",
+                None,
+            ),
+        ):
+            assert _get_shared_graph_pool() is pool
+            assert _get_shared_graph_pool() is pool
+        fake_npu.graph_pool_handle.assert_called_once_with()
 
     @staticmethod
     def _metadata() -> SimpleNamespace:
@@ -440,6 +500,13 @@ class TestDecodeAclGraphSpeculativeMetadata:
         input_ids = torch.arange(4, dtype=torch.int32)
 
         assert runner.can_execute(input_ids, self._metadata())
+
+    def test_decode_graph_rejects_block_tables_beyond_configured_context(self) -> None:
+        runner = self._runner()
+        metadata = self._metadata()
+        metadata.expanded_decode_metadata.block_table = torch.zeros((4, 3), dtype=torch.int32)
+
+        assert not runner.can_execute(torch.arange(4, dtype=torch.int32), metadata)
 
     @pytest.mark.parametrize(
         ("field", "value", "message"),
@@ -618,6 +685,56 @@ class TestDecodeAclGraphSpeculativeMetadata:
         graph.replay.assert_called_once_with()
 
 
+def test_deepseek_mtp_topk_is_computed_once_then_reused() -> None:
+    from xllm.python.model_executor.forward_context import (
+        ForwardContext,
+        forward_context,
+    )
+    from xllm.python.models.deepseek_v32 import DeepseekV3MLAAttention
+
+    computed = torch.tensor([[[3, 2]]], dtype=torch.int32)
+    indexer = MagicMock()
+    indexer.select_qli.return_value = computed
+    attention = DeepseekV3MLAAttention.__new__(DeepseekV3MLAAttention)
+    nn.Module.__init__(attention)
+    attention.indexer = indexer
+    backend = MagicMock()
+    backend.mla_index_context.return_value = MagicMock()
+    args = (
+        torch.empty(1, 4),
+        torch.empty(1, 2),
+        backend,
+        torch.empty(1, 1),
+        torch.empty(1, 1),
+    )
+
+    first_output = [None]
+    first_context = ForwardContext(
+        backend,
+        torch.device("cpu"),
+        MagicMock(),
+        [],
+        mtp_topk_output=first_output,
+    )
+    with forward_context(first_context):
+        assert attention._select_mtp_topk(*args) is computed
+
+    next_output = [computed]
+    next_context = ForwardContext(
+        backend,
+        torch.device("cpu"),
+        MagicMock(),
+        [],
+        mtp_topk_indices=computed,
+        mtp_topk_output=next_output,
+    )
+    with forward_context(next_context):
+        assert attention._select_mtp_topk(*args) is computed
+
+    indexer.select_qli.assert_called_once()
+    indexer.update_qli_cache.assert_called_once()
+
+
 # ---------------------------------------------------------------------------
 # Tests: ModelExecutor.bind_kv_caches
 # ---------------------------------------------------------------------------
@@ -726,3 +843,39 @@ class TestExecuteRouting:
         result = executor.execute(torch.zeros(1), torch.zeros(1), metadata)
         executor.inductor_runner.execute.assert_called_once()
         assert torch.equal(result, torch.ones(3))
+
+
+class TestEagerRunner:
+    def test_prepare_runs_inside_forward_context(self):
+        from xllm.python.model_executor.forward_context import (
+            AclGraphCaptureContext,
+            AclGraphExecutionState,
+            get_forward_context,
+        )
+
+        model = MagicMock(return_value=torch.ones(1))
+        backend = StubAttentionBackend()
+        observed_contexts = []
+        backend.prepare = MagicMock(
+            side_effect=lambda *_args, **_kwargs: observed_contexts.append(get_forward_context())
+        )
+        runner = EagerRunner(model, backend, torch.device("cpu"))
+        metadata = MagicMock(spec=AttentionMetadata)
+        capture_context = AclGraphCaptureContext(object(), [])
+        execution_state = AclGraphExecutionState({})
+
+        runner.execute(
+            torch.tensor([1], dtype=torch.int32),
+            torch.tensor([0], dtype=torch.int32),
+            metadata,
+            acl_graph=capture_context,
+            execution_state=execution_state,
+            graph_mode=True,
+        )
+
+        assert len(observed_contexts) == 1
+        assert observed_contexts[0].metadata is metadata
+        assert observed_contexts[0].acl_graph is capture_context
+        assert observed_contexts[0].execution_state is execution_state
+        with pytest.raises(RuntimeError, match="forward context is not set"):
+            get_forward_context()

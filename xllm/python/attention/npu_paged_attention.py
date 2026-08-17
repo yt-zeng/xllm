@@ -220,7 +220,7 @@ class NpuPagedAttentionBackend(AttentionBackend):
                 else:
                     raise RuntimeError("host KV lengths must have one entry per block-table row")
             self._actual_seq_q: list[int] = list(range(1, real_batch + 1))
-            self._actual_seq_kv: list[int] = list(kv_seq_lens_host_values)
+            self._actual_seq_kv = kv_seq_lens_host_values if graph_mode else list(kv_seq_lens_host_values)
         else:
             self._actual_seq_q = []
             self._actual_seq_kv = []
@@ -329,7 +329,9 @@ class NpuPagedAttentionBackend(AttentionBackend):
                 else:
                     self._mla_actual_seq_q_host = list(range(1, int(actual_seq_kv.numel()) + 1))
                 if kv_seq_lens_host_values is not None:
-                    self._mla_actual_seq_kv_host = list(kv_seq_lens_host_values)
+                    self._mla_actual_seq_kv_host = (
+                        kv_seq_lens_host_values if graph_mode else list(kv_seq_lens_host_values)
+                    )
                 else:
                     self._mla_actual_seq_kv_host = actual_seq_kv.cpu().tolist()
             else:
@@ -597,17 +599,13 @@ class NpuPagedAttentionBackend(AttentionBackend):
         workspace: torch.Tensor,
         output: torch.Tensor,
         softmax_lse: torch.Tensor,
+        actual_seq_q_host: list[int],
+        actual_seq_kv_host: list[int],
+        is_prefill: bool,
     ) -> None:
-        if self._mla_actual_seq_q_host is None:
-            raise RuntimeError("dense MLA requires query sequence lengths")
-        if self._mla_actual_seq_kv_host is None:
-            raise RuntimeError("dense MLA requires KV sequence lengths")
         block_size = nope_cache.size(1)
         nope_flat = nope_cache.view(nope_cache.size(0), block_size, -1)
         rope_flat = rope_cache.view(rope_cache.size(0), block_size, -1)
-        is_prefill = bool(
-            self._metadata is not None and (self._metadata.is_prefill or self._metadata.is_chunked_prefill)
-        )
         torch.ops.npu.npu_fused_infer_attention_score_v2.out(
             q_latent,
             nope_flat,
@@ -616,8 +614,8 @@ class NpuPagedAttentionBackend(AttentionBackend):
             key_rope=rope_flat,
             pse_shift=None,
             atten_mask=self._causal_mask if is_prefill else None,
-            actual_seq_qlen=self._mla_actual_seq_q_host,
-            actual_seq_kvlen=self._mla_actual_seq_kv_host,
+            actual_seq_qlen=actual_seq_q_host,
+            actual_seq_kvlen=actual_seq_kv_host,
             block_table=block_table,
             num_query_heads=self.num_heads,
             num_key_value_heads=1,
@@ -696,6 +694,16 @@ class NpuPagedAttentionBackend(AttentionBackend):
             )
             self._mla_graph_workspaces[output_key] = workspace
 
+        actual_seq_q_host = self._mla_actual_seq_q_host
+        actual_seq_kv_host = self._mla_actual_seq_kv_host
+        if actual_seq_q_host is None:
+            raise RuntimeError("dense MLA requires query sequence lengths")
+        if actual_seq_kv_host is None:
+            raise RuntimeError("dense MLA requires KV sequence lengths")
+        is_prefill = bool(
+            self._metadata is not None and (self._metadata.is_prefill or self._metadata.is_chunked_prefill)
+        )
+
         stream = graph_context.stream
         event = torch.npu.ExternalEvent()
         event.wait(stream)
@@ -711,6 +719,9 @@ class NpuPagedAttentionBackend(AttentionBackend):
                 workspace,
                 output,
                 softmax_lse,
+                actual_seq_q_host,
+                actual_seq_kv_host,
+                is_prefill,
             )
         except Exception:
             torch.npu.graph_task_group_end(stream)
@@ -727,6 +738,9 @@ class NpuPagedAttentionBackend(AttentionBackend):
                 workspace,
                 output,
                 softmax_lse,
+                actual_seq_q_host,
+                actual_seq_kv_host,
+                is_prefill,
             )
 
         graph_context.tasks.append(AclGraphTask(event, handle, _update_mla_fia_v2_args))
@@ -887,6 +901,12 @@ class NpuPagedAttentionBackend(AttentionBackend):
         k: torch.Tensor,
         v: torch.Tensor,
         block_size: int,
+        actual_seq_q: list[int],
+        actual_seq_kv: list[int],
+        block_table: torch.Tensor,
+        workspace: torch.Tensor,
+        output: torch.Tensor,
+        softmax_lse: torch.Tensor,
     ) -> None:
         if self._use_fia_v2:
             torch.ops.npu.npu_fused_infer_attention_score_v2.out(
@@ -897,9 +917,9 @@ class NpuPagedAttentionBackend(AttentionBackend):
                 key_rope=None,
                 pse_shift=None,
                 atten_mask=None,
-                actual_seq_qlen=self._actual_seq_q,
-                actual_seq_kvlen=self._actual_seq_kv,
-                block_table=self._block_table_i32,
+                actual_seq_qlen=actual_seq_q,
+                actual_seq_kvlen=actual_seq_kv,
+                block_table=block_table,
                 num_query_heads=self.num_heads,
                 softmax_scale=self.scale,
                 input_layout="TND",
@@ -907,8 +927,8 @@ class NpuPagedAttentionBackend(AttentionBackend):
                 sparse_mode=_SPARSE_MODE_NONE,
                 block_size=block_size,
                 return_softmax_lse=False,
-                workspace=self._graph_workspace,
-                out=[self._current_graph_output, self._current_graph_lse],
+                workspace=workspace,
+                out=[output, softmax_lse],
             )
             return
 
@@ -918,9 +938,9 @@ class NpuPagedAttentionBackend(AttentionBackend):
             v,
             pse_shift=None,
             atten_mask=None,
-            actual_seq_lengths=self._actual_seq_q,
-            actual_seq_lengths_kv=self._actual_seq_kv,
-            block_table=self._block_table_i32,
+            actual_seq_lengths=actual_seq_q,
+            actual_seq_lengths_kv=actual_seq_kv,
+            block_table=block_table,
             num_heads=self.num_heads,
             scale=self.scale,
             input_layout="TND",
@@ -928,8 +948,8 @@ class NpuPagedAttentionBackend(AttentionBackend):
             sparse_mode=_SPARSE_MODE_NONE,
             block_size=block_size,
             softmax_lse_flag=False,
-            workspace=self._graph_workspace,
-            out=[self._current_graph_output, self._current_graph_lse],
+            workspace=workspace,
+            out=[output, softmax_lse],
         )
 
     def _decode(
@@ -946,25 +966,59 @@ class NpuPagedAttentionBackend(AttentionBackend):
 
         graph_context = get_forward_context().acl_graph
         if graph_context is not None:
-            if self._current_graph_output is None:
+            actual_seq_q = self._actual_seq_q
+            actual_seq_kv = self._actual_seq_kv
+            block_table = self._block_table_i32
+            workspace = self._graph_workspace
+            output = self._current_graph_output
+            softmax_lse = self._current_graph_lse
+            if block_table is None:
+                raise RuntimeError("ACL graph block table is not prepared")
+            if workspace is None:
+                raise RuntimeError("ACL graph workspace is not prepared")
+            if output is None:
                 raise RuntimeError("ACL graph output buffer is not prepared")
+            if softmax_lse is None:
+                raise RuntimeError("ACL graph softmax buffer is not prepared")
             stream = graph_context.stream
             event = torch.npu.ExternalEvent()
             event.wait(stream)
             event.reset(stream)
             torch.npu.graph_task_group_begin(stream)
             try:
-                self._fia_out(q_3d, k_flat, v_flat, block_size)
+                self._fia_out(
+                    q_3d,
+                    k_flat,
+                    v_flat,
+                    block_size,
+                    actual_seq_q,
+                    actual_seq_kv,
+                    block_table,
+                    workspace,
+                    output,
+                    softmax_lse,
+                )
             except Exception:
                 torch.npu.graph_task_group_end(stream)
                 raise
             handle = torch.npu.graph_task_group_end(stream)
 
             def _update_fia_args() -> None:
-                self._fia_out(q_3d, k_flat, v_flat, block_size)
+                self._fia_out(
+                    q_3d,
+                    k_flat,
+                    v_flat,
+                    block_size,
+                    actual_seq_q,
+                    actual_seq_kv,
+                    block_table,
+                    workspace,
+                    output,
+                    softmax_lse,
+                )
 
             graph_context.tasks.append(AclGraphTask(event, handle, _update_fia_args))
-            return self._current_graph_output.reshape(num_tokens, self.num_heads * self.head_dim)
+            return output.reshape(num_tokens, self.num_heads * self.head_dim)
 
         if self._use_fia_v2:
             output, _ = torch.ops.npu.npu_fused_infer_attention_score_v2(

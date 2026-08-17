@@ -309,6 +309,7 @@ class DeepseekV3Config:
     index_n_heads: int = 64
     index_head_dim: int = 128
     index_topk: int = 2048
+    index_share_for_mtp_iteration: bool = False
     first_k_dense_replace: int = 3
     moe_layer_freq: int = 1
     n_routed_experts: int = 256
@@ -376,6 +377,7 @@ class DeepseekV3Config:
             index_n_heads=int(pick("index_n_heads", default=64)),
             index_head_dim=int(pick("index_head_dim", default=128)),
             index_topk=int(pick("index_topk", default=2048)),
+            index_share_for_mtp_iteration=bool(pick("index_share_for_mtp_iteration", default=False)),
             qk_nope_head_dim=int(pick("qk_nope_head_dim", default=128)),
             qk_rope_head_dim=int(pick("qk_rope_head_dim", default=64)),
             v_head_dim=int(pick("v_head_dim", default=128)),
@@ -952,16 +954,7 @@ class DeepseekV3MLAAttention(Attention):
                 self.q_a_layernorm.eps,
                 self.kv_a_layernorm.eps,
             )
-        topk = None
-        if self.indexer is not None:
-            index_context = backend.mla_index_context(self)
-            topk = self.indexer.select_qli(
-                hidden,
-                q_c,
-                index_context,
-                half_rope_cos,
-                half_rope_sin,
-            )
+        topk = self._select_mtp_topk(hidden, q_c, backend, half_rope_cos, half_rope_sin)
         attn_out = backend.execute_mla(
             q_latent,
             q_pe,
@@ -977,6 +970,34 @@ class DeepseekV3MLAAttention(Attention):
         if self.cfg.tp_size > 1:
             distributed.all_reduce_(output)
         return output
+
+    def _select_mtp_topk(
+        self,
+        hidden: torch.Tensor,
+        q_c: torch.Tensor,
+        backend: AttentionBackend,
+        half_rope_cos: torch.Tensor,
+        half_rope_sin: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Resolve normal DSA top-k or the cross-step MTP reuse state."""
+        if self.indexer is None:
+            return None
+        ctx = backend.mla_index_context(self)
+        forward_ctx = get_forward_context()
+        mtp_output = forward_ctx.mtp_topk_output
+        if mtp_output is None:
+            return self.indexer.select_qli(hidden, q_c, ctx, half_rope_cos, half_rope_sin)
+
+        # The exported V3.2 MTP draft has one sparse-attention layer. The
+        # first step computes top-k normally; later steps reuse those indices
+        # while appending the current token's key for the following step.
+        topk = forward_ctx.mtp_topk_indices
+        if topk is None:
+            topk = self.indexer.select_qli(hidden, q_c, ctx, half_rope_cos, half_rope_sin)
+        else:
+            self.indexer.update_qli_cache(hidden, ctx, half_rope_cos, half_rope_sin)
+        mtp_output[0] = topk
+        return topk
 
     def forward(
         self,
@@ -1016,16 +1037,7 @@ class DeepseekV3MLAAttention(Attention):
             torch.qint8,
             -1,
         )
-        topk = None
-        if self.indexer is not None:
-            ctx = backend.mla_index_context(self)
-            topk = self.indexer.select_qli(
-                hidden,
-                q_c,
-                ctx,
-                half_rope_cos,
-                half_rope_sin,
-            )
+        topk = self._select_mtp_topk(hidden, q_c, backend, half_rope_cos, half_rope_sin)
         q = self.q_b_proj.forward_quantized(q_a_norm_quant)
         q = q.view(
             num_tokens,
@@ -1157,6 +1169,27 @@ class DeepseekV3Indexer(nn.Module):
             values_buffer,
         )
         return topk
+
+    def update_qli_cache(
+        self,
+        hidden: torch.Tensor,
+        ctx: MlaIndexContext,
+        half_rope_cos: torch.Tensor,
+        half_rope_sin: torch.Tensor,
+    ) -> None:
+        """Append DSA keys without recomputing sparse top-k."""
+        k, _ = self.wk_weights_proj(hidden).split([self.head_dim, self.n_head], dim=-1)
+        k = self.k_norm(k)
+        k_pe, k_nope = torch.split(k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1)
+        k_pe = _apply_half_rope_with_angles(k_pe.unsqueeze(1), half_rope_cos, half_rope_sin).squeeze(1)
+        k = torch.cat([k_pe, k_nope], dim=-1)
+        if ctx.index_cache.dtype == torch.int8 and ctx.index_cache_scale is not None:
+            k = torch.matmul(k, self.hadamard) * (self.head_dim**-0.5)
+            k, k_scale = kernels.dynamic_quant(k)
+            assert k_scale is not None
+            ctx.update_index_cache(k, k_scale.unsqueeze(-1).to(torch.float16))
+        else:
+            ctx.update_index_cache(k, None)
 
 
 class DeepseekV3MoE(nn.Module):

@@ -52,6 +52,8 @@ TEST(MtpAsyncStateTest, ClassifiesSupportedCombinedDraftExecutionPaths) {
             CombinedDraftExecutionPath::QWEN3_5_PAGED_ATTENTION);
   EXPECT_EQ(classify_combined_draft_execution_path("glm_moe_dsa_mtp"),
             CombinedDraftExecutionPath::GLM_MOE_DSA_SPARSE_ATTENTION);
+  EXPECT_EQ(classify_combined_draft_execution_path("deepseek_v32_mtp"),
+            CombinedDraftExecutionPath::DEEPSEEK_V32_DSA_SPARSE_ATTENTION);
   EXPECT_EQ(classify_combined_draft_execution_path("mimo_mtp"),
             CombinedDraftExecutionPath::UNSUPPORTED);
 }
@@ -81,8 +83,31 @@ TEST(MtpAsyncStateTest, RestrictsCombinedDraftToValidatedConfigurations) {
       CombinedDraftExecutionPath::GLM_MOE_DSA_SPARSE_ATTENTION,
       "TORCH",
       /*dp_size=*/1));
+  EXPECT_TRUE(supports_combined_draft_configuration(
+      CombinedDraftExecutionPath::DEEPSEEK_V32_DSA_SPARSE_ATTENTION,
+      "TORCH",
+      /*dp_size=*/1));
+  EXPECT_FALSE(supports_combined_draft_configuration(
+      CombinedDraftExecutionPath::DEEPSEEK_V32_DSA_SPARSE_ATTENTION,
+      "ATB",
+      /*dp_size=*/1));
+  EXPECT_FALSE(supports_combined_draft_configuration(
+      CombinedDraftExecutionPath::DEEPSEEK_V32_DSA_SPARSE_ATTENTION,
+      "TORCH",
+      /*dp_size=*/2));
   EXPECT_FALSE(supports_combined_draft_configuration(
       CombinedDraftExecutionPath::UNSUPPORTED, "ATB", /*dp_size=*/1));
+}
+
+TEST(MtpAsyncStateTest, IdentifiesContinuousDsaDraftPaths) {
+  EXPECT_TRUE(uses_continuous_dsa_drafts(
+      CombinedDraftExecutionPath::GLM_MOE_DSA_SPARSE_ATTENTION));
+  EXPECT_TRUE(uses_continuous_dsa_drafts(
+      CombinedDraftExecutionPath::DEEPSEEK_V32_DSA_SPARSE_ATTENTION));
+  EXPECT_FALSE(uses_continuous_dsa_drafts(
+      CombinedDraftExecutionPath::QWEN3_5_PAGED_ATTENTION));
+  EXPECT_FALSE(
+      uses_continuous_dsa_drafts(CombinedDraftExecutionPath::UNSUPPORTED));
 }
 
 TEST(MtpAsyncStateTest, ExtractsTargetBaseKvLengthsFromVerifyLayouts) {

@@ -158,6 +158,24 @@ TEST_F(FastTokenizerTest, AddBosToken) {
   EXPECT_GT(ids.size(), 1) << "Should have more than just BOS token";
 }
 
+TEST_F(FastTokenizerTest, DisableSpecialTokensSkipsConfiguredBosAndEos) {
+  TokenizerArgs args;
+  args.tokenizer_type() = "fast";
+  args.vocab_file() = tokenizer_json_path_.string();
+  args.add_bos_token() = true;
+  args.bos_token() = "<|bos|>";
+  args.add_eos_token() = true;
+  args.eos_token() = "<|eos|>";
+
+  FastTokenizer tokenizer(args);
+
+  std::vector<int32_t> ids;
+  ASSERT_TRUE(tokenizer.encode("hello", &ids, /*add_special_tokens=*/false));
+  EXPECT_EQ(ids, std::vector<int32_t>({2}))
+      << "stop sequences must not be prefixed or suffixed with configured "
+         "special tokens";
+}
+
 // Test that EOS token is added when add_eos_token is true
 TEST_F(FastTokenizerTest, AddEosToken) {
   TokenizerArgs args;

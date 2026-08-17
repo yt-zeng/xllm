@@ -16,6 +16,7 @@ limitations under the License.
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <unordered_set>
 #include <vector>
 
@@ -23,6 +24,8 @@ limitations under the License.
 #include "finish_reason.h"
 
 namespace xllm {
+
+class Tokenizer;
 
 class StoppingChecker {
  public:
@@ -33,11 +36,13 @@ class StoppingChecker {
                   int32_t eos_token,
                   bool ignore_eos,
                   const std::unordered_set<int32_t>& stop_tokens,
-                  const std::vector<std::vector<int32_t>>& stop_sequences);
+                  const std::vector<std::vector<int32_t>>& stop_sequences,
+                  const std::vector<std::string>& stop_strings = {});
 
   FinishReason check(const Slice<int32_t>& token_ids,
                      size_t num_prompt_tokens,
-                     size_t* matched_stop_token_count = nullptr) const;
+                     size_t* matched_stop_token_count = nullptr,
+                     std::string* matched_stop_string = nullptr) const;
 
   inline void set_max_generated_tokens(size_t tokens) {
     max_generated_tokens_ = tokens;
@@ -78,6 +83,17 @@ class StoppingChecker {
 
   size_t get_max_stop_sequence_token_count() const;
 
+  // Configure raw-text stop matching. Text stop sequences cannot reliably be
+  // represented by a single token sequence because BPE tokenization depends on
+  // the generated prefix. The tokenizer is owned by the serving master.
+  inline void set_text_stop_tokenizer(const Tokenizer* tokenizer) {
+    text_stop_tokenizer_ = tokenizer;
+  }
+
+  size_t get_max_stop_string_byte_count() const;
+
+  const std::vector<std::string>& stop_strings() const { return stop_strings_; }
+
  private:
   size_t max_generated_tokens_ = 5120;
 
@@ -94,6 +110,12 @@ class StoppingChecker {
 
   // stopping sequences
   std::vector<std::vector<int32_t>> stop_sequences_;
+
+  // Original text stop strings, checked against the decoded generated suffix.
+  std::vector<std::string> stop_strings_;
+
+  // Non-owning; the master owns the tokenizer for the lifetime of requests.
+  const Tokenizer* text_stop_tokenizer_ = nullptr;
 };
 
 }  // namespace xllm

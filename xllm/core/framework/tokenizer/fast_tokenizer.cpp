@@ -87,7 +87,8 @@ bool FastTokenizer::encode(const std::string_view& text,
   }
 
   // Add BOS token if configured
-  if (tokenizer_args_.add_bos_token() && !tokenizer_args_.bos_token().empty()) {
+  if (add_special_tokens && tokenizer_args_.add_bos_token() &&
+      !tokenizer_args_.bos_token().empty()) {
     const auto bos_id = token_to_id(tokenizer_args_.bos_token());
     add_special_token_id(tokenizer_args_.bos_token(),
                          bos_id,
@@ -96,7 +97,8 @@ bool FastTokenizer::encode(const std::string_view& text,
   }
 
   // Add EOS token if configured
-  if (tokenizer_args_.add_eos_token() && !tokenizer_args_.eos_token().empty()) {
+  if (add_special_tokens && tokenizer_args_.add_eos_token() &&
+      !tokenizer_args_.eos_token().empty()) {
     const auto eos_id = token_to_id(tokenizer_args_.eos_token());
     add_special_token_id(tokenizer_args_.eos_token(),
                          eos_id,

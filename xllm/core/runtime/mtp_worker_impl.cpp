@@ -970,7 +970,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_empty(
   if (pending_draft_context_.output.has_value() &&
       !use_prelaunched_first_draft) {
     // The preceding validation may have speculatively submitted draft-0 before
-    // the scheduler learned that the batch had finished.  Keep its graph/input
+    // the scheduler learned that the batch had finished. Keep its graph/input
     // buffers alive until the queued work completes, then discard the result.
     // This is a batch-exit slow path and is never taken in steady decode.
     const int32_t ret = compute_stream_->synchronize();
@@ -1244,9 +1244,9 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
       pending_target_context_.ready_event;
   if (pending_draft_context_.output.has_value() &&
       !use_prelaunched_first_draft) {
-    // A batch transition invalidates the speculative prelaunch.  Drain it
-    // before releasing its graph/input buffers; this slow path is outside
-    // steady decode and preserves cache/buffer lifetime correctness.
+    // A batch transition invalidates the speculative prelaunch. Drain it before
+    // releasing its graph/input buffers; this slow path is outside steady
+    // decode and preserves cache/buffer lifetime correctness.
     const int32_t ret = compute_stream_->synchronize();
     CHECK_EQ(ret, 0) << "failed to drain stale MTP draft prelaunch, ret="
                      << ret;

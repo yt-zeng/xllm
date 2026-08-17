@@ -44,6 +44,7 @@ enum class CombinedDraftExecutionPath {
   UNSUPPORTED,
   QWEN3_5_PAGED_ATTENTION,
   GLM_MOE_DSA_SPARSE_ATTENTION,
+  DEEPSEEK_V32_DSA_SPARSE_ATTENTION,
 };
 
 CombinedDraftExecutionPath classify_combined_draft_execution_path(
@@ -53,6 +54,8 @@ bool supports_combined_draft_configuration(
     CombinedDraftExecutionPath execution_path,
     std::string_view npu_backend,
     int32_t dp_size);
+
+bool uses_continuous_dsa_drafts(CombinedDraftExecutionPath execution_path);
 
 // Materialize proposer-owned token columns into the row-major target verify
 // input. Graph replay normally performs this copy internally; eager fallback

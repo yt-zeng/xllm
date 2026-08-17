@@ -515,6 +515,8 @@ class Sequence final {
   // generated tokens for usage and scheduling accounting.
   size_t get_decodable_token_count(size_t size) const;
 
+  void trim_matched_stop_string(std::string* text) const;
+
   SequenceOutputType output_type();
   void generate_embeddings_output(SequenceOutput& output);
   void generate_mm_embeddings_output(SequenceOutput& output);
@@ -648,6 +650,15 @@ class Sequence final {
   // tokens remain in `tokens_` and are omitted from decoded output when
   // `include_stop_str_in_output` is false.
   mutable size_t matched_stop_token_count_ = 0;
+
+  // The raw text stop that ended this sequence, if it was matched through the
+  // decoded-text fallback rather than the token-id fast path.
+  mutable std::string matched_stop_string_;
+
+  // Decoded text retained while streaming a request with raw text stop
+  // strings. Keeping only a possible stop prefix prevents a later token from
+  // completing a stop sequence that has already been sent to the client.
+  std::string streaming_text_stop_buffer_;
 
   // is the sequence closed.
   bool closed_ = false;

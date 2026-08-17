@@ -307,6 +307,8 @@ Sequence::Sequence(const Sequence& other)
       finish_status_invalidated_(other.finish_status_invalidated_),
       finish_reason_(other.finish_reason_),
       matched_stop_token_count_(other.matched_stop_token_count_),
+      matched_stop_string_(other.matched_stop_string_),
+      streaming_text_stop_buffer_(other.streaming_text_stop_buffer_),
       closed_(other.closed_),
       dp_rank_(other.dp_rank_),
       cur_generated_token_idx_(other.cur_generated_token_idx_),
@@ -536,6 +538,44 @@ std::optional<SequenceOutput> Sequence::generate_streaming_output(
 
   const size_t token_start = stream_output_token_offset_;
   auto delta = decoder_.decode(decodable_ids, tokenizer);
+
+  // Token IDs are not a stable representation of a text stop: BPE
+  // tokenization of a stop in isolation can differ from its tokenization after
+  // generated text. Keep a possible raw-text stop prefix in a small buffer so
+  // a later token cannot make already streamed text part of a stop sequence.
+  const size_t max_stop_bytes =
+      sequence_params_.stopping_checker->get_max_stop_string_byte_count();
+  if (!sequence_params_.include_stop_str_in_output && max_stop_bytes > 0) {
+    streaming_text_stop_buffer_.append(delta);
+    if (!matched_stop_string_.empty()) {
+      if (absl::EndsWith(streaming_text_stop_buffer_, matched_stop_string_)) {
+        streaming_text_stop_buffer_.resize(streaming_text_stop_buffer_.size() -
+                                           matched_stop_string_.size());
+      }
+      delta = std::move(streaming_text_stop_buffer_);
+      streaming_text_stop_buffer_.clear();
+    } else if (finished_) {
+      delta = std::move(streaming_text_stop_buffer_);
+      streaming_text_stop_buffer_.clear();
+    } else {
+      size_t keep_size = 0;
+      for (const auto& stop_string :
+           sequence_params_.stopping_checker->stop_strings()) {
+        const size_t max_prefix_size =
+            std::min(stop_string.size(), streaming_text_stop_buffer_.size());
+        for (size_t prefix_size = 1; prefix_size < max_prefix_size;
+             ++prefix_size) {
+          if (absl::EndsWith(streaming_text_stop_buffer_,
+                             stop_string.substr(0, prefix_size))) {
+            keep_size = std::max(keep_size, prefix_size);
+          }
+        }
+      }
+      const size_t emit_size = streaming_text_stop_buffer_.size() - keep_size;
+      delta = streaming_text_stop_buffer_.substr(0, emit_size);
+      streaming_text_stop_buffer_.erase(0, emit_size);
+    }
+  }
   // NOTE:
   // There is a incomprehensible logic here: we use a thread pool to handle
   // request callbacks in response handler, which means that the main thread and
@@ -730,6 +770,7 @@ SequenceOutput Sequence::generate_output(const Tokenizer& tokenizer) {
   }
 
   output.text = ss.str();
+  trim_matched_stop_string(&output.text);
 
   const size_t end = size;
   output.token_ids = ids.slice(start, end);
@@ -891,15 +932,29 @@ bool Sequence::finished() const {
   finish_status_invalidated_ = false;
 
   size_t matched_stop_token_count = 0;
-  const FinishReason finish_reason = sequence_params_.stopping_checker->check(
-      tokens(), num_prompt_tokens_, &matched_stop_token_count);
+  std::string matched_stop_string;
+  const FinishReason finish_reason =
+      sequence_params_.stopping_checker->check(tokens(),
+                                               num_prompt_tokens_,
+                                               &matched_stop_token_count,
+                                               &matched_stop_string);
   matched_stop_token_count_ = matched_stop_token_count;
+  matched_stop_string_ = std::move(matched_stop_string);
   if (finish_reason != FinishReason::NONE) {
     finish_reason_ = finish_reason;
     finished_ = true;
     return true;
   }
   return false;
+}
+
+void Sequence::trim_matched_stop_string(std::string* text) const {
+  if (sequence_params_.include_stop_str_in_output ||
+      matched_stop_string_.empty() ||
+      !absl::EndsWith(*text, matched_stop_string_)) {
+    return;
+  }
+  text->resize(text->size() - matched_stop_string_.size());
 }
 
 size_t Sequence::get_decodable_token_count(size_t size) const {
@@ -1007,6 +1062,8 @@ void Sequence::finish() {
   finished_ = true;
   finish_status_invalidated_ = false;
   matched_stop_token_count_ = 0;
+  matched_stop_string_.clear();
+  streaming_text_stop_buffer_.clear();
   if (finish_reason_ == FinishReason::NONE) {
     finish_reason_ = FinishReason::STOP;
   }
@@ -1016,6 +1073,8 @@ void Sequence::reset_finish_state_for_beam_search() {
   finished_ = false;
   finish_reason_ = FinishReason::NONE;
   matched_stop_token_count_ = 0;
+  matched_stop_string_.clear();
+  streaming_text_stop_buffer_.clear();
   finish_status_invalidated_ = true;
   finished();
 }

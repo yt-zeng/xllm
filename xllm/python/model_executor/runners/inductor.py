@@ -37,7 +37,9 @@ class InductorRunner(BaseRunner):
         metadata: AttentionMetadata,
         input_embedding: torch.Tensor | None = None,
         layer_synchronizer: LayerSynchronizer | None = None,
-    ) -> torch.Tensor:
+        mtp_topk_indices: torch.Tensor | None = None,
+        enable_mtp_topk_reuse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
         self.attention_backend.prepare(metadata)
         with forward_context(
             ForwardContext(
@@ -46,6 +48,8 @@ class InductorRunner(BaseRunner):
                 metadata,
                 self.layer_caches,
                 layer_synchronizer=layer_synchronizer,
+                mtp_topk_indices=mtp_topk_indices,
+                mtp_topk_output=([mtp_topk_indices] if enable_mtp_topk_reuse else None),
             )
         ):
             if input_embedding is None:

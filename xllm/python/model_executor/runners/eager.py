@@ -19,6 +19,8 @@ import torch
 from xllm.python.attention.backend import AttentionMetadata
 from xllm.python.model_executor.cp_utils import build_cp_context
 from xllm.python.model_executor.forward_context import (
+    AclGraphCaptureContext,
+    AclGraphExecutionState,
     ForwardContext,
     LayerSynchronizer,
     forward_context,
@@ -53,9 +55,12 @@ class EagerRunner(BaseRunner):
         metadata: AttentionMetadata,
         input_embedding: torch.Tensor | None = None,
         layer_synchronizer: LayerSynchronizer | None = None,
-    ) -> torch.Tensor:
-        self.attention_backend.prepare(metadata)
-
+        mtp_topk_indices: torch.Tensor | None = None,
+        enable_mtp_topk_reuse: bool = False,
+        acl_graph: AclGraphCaptureContext | None = None,
+        execution_state: AclGraphExecutionState | None = None,
+        graph_mode: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
         cp_context = None
         if self.cp_size > 1 and metadata.is_prefill:
             seq_lens = _per_seq_lens_from_metadata(metadata)
@@ -69,9 +74,14 @@ class EagerRunner(BaseRunner):
                 metadata,
                 self.layer_caches,
                 layer_synchronizer=layer_synchronizer,
+                acl_graph=acl_graph,
+                execution_state=execution_state,
                 cp_context=cp_context,
+                mtp_topk_indices=mtp_topk_indices,
+                mtp_topk_output=([mtp_topk_indices] if enable_mtp_topk_reuse else None),
             )
         ):
+            self.attention_backend.prepare(metadata, graph_mode=graph_mode)
             if input_embedding is None:
                 return self.model(input_ids, positions)
             return self.model(input_ids, positions, input_embedding)

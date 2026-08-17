@@ -57,14 +57,6 @@ ProfileManager::ProfileManager(Engine* engine, const Options& options)
     max_decode_batch_size =
         std::min(max_decode_batch_size, max_concurrent_requests);
   }
-#if defined(USE_NPU)
-  const int32_t graph_decode_batch_size_limit =
-      std::max<int32_t>(1,
-                        ::xllm::ExecutionConfig::get_instance()
-                            .acl_graph_decode_batch_size_limit());
-  max_decode_batch_size =
-      std::min(max_decode_batch_size, graph_decode_batch_size_limit);
-#endif
   decode_graph_warmup_plan_ =
       build_decode_graph_warmup_plan(engine_->decode_graph_execution_shape(),
                                      max_decode_batch_size,
